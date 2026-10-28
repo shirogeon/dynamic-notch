@@ -1,0 +1,18 @@
+# Backups
+*.bak*
+*.bak
+
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environments
+.env
+.venv
+env/
+venv/
+
+# Logs and scratch
+*.log
+*.tmp
