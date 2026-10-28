@@ -635,40 +635,113 @@ class LyricsController:
             daemon=True
         ).start()
 
+    @staticmethod
+    def _score_candidate(cand: dict, title: str, artist: str, duration_s: int) -> int:
+        cand_title = cand.get("trackName") or ""
+        cand_artist = cand.get("artistName") or ""
+        cand_dur = float(cand.get("duration") or 0)
+        has_synced = bool(cand.get("syncedLyrics"))
+        is_inst = bool(cand.get("instrumental"))
+
+        # Must provide synchronized lyrics or be marked instrumental
+        if not has_synced and not is_inst:
+            return -1
+
+        clean_t = LyricsController.clean_title(title).lower()
+        clean_ct = LyricsController.clean_title(cand_title).lower()
+
+        # Title compatibility check
+        if clean_t == clean_ct:
+            title_score = 40
+        elif clean_t in clean_ct or clean_ct in clean_t:
+            title_score = 25
+        else:
+            return -1  # Reject candidate with incompatible title
+
+        # Artist compatibility check
+        a_low = artist.lower()
+        ca_low = cand_artist.lower()
+        if a_low == ca_low:
+            artist_score = 30
+        elif a_low in ca_low or ca_low in a_low:
+            artist_score = 20
+        else:
+            a_words = set(re.findall(r"\w+", a_low))
+            ca_words = set(re.findall(r"\w+", ca_low))
+            if a_words & ca_words:
+                artist_score = 15
+            else:
+                return -1  # Reject candidate with incompatible artist
+
+        # Duration validation (~4s tolerance initial criterion)
+        dur_score = 0
+        if duration_s > 0 and cand_dur > 0:
+            diff = abs(cand_dur - duration_s)
+            if diff <= 2.0:
+                dur_score = 30
+            elif diff <= 4.5:
+                dur_score = 20
+            elif diff <= 8.0:
+                dur_score = 5
+            else:
+                return -1  # Reject candidate with obviously different duration (> 8s)
+
+        synced_score = 50 if has_synced else 30
+        return synced_score + title_score + artist_score + dur_score
+
     def _fetch_lyrics(self, token: int, key: str, title: str, artist: str, album: str | None, duration_s: int):
         status = self.STATUS_UNAVAILABLE
         lines = []
 
         cleaned_title = self.clean_title(title)
+        data = None
 
-        # Stage 1: Exact GET with duration
-        params = {"track_name": title, "artist_name": artist}
-        if duration_s > 0:
-            params["duration"] = duration_s
+        # Stage 1A: Exact GET with album (if provided) and duration
         if album:
+            params = {"track_name": title, "artist_name": artist}
+            if duration_s > 0:
+                params["duration"] = duration_s
             params["album_name"] = album
+            data = self._http_get(self.LRCLIB_GET, params)
 
-        data = self._http_get(self.LRCLIB_GET, params)
+        # Stage 1B: Exact GET without album (fixes Spotify album-edition mismatches)
+        if not data:
+            params = {"track_name": title, "artist_name": artist}
+            if duration_s > 0:
+                params["duration"] = duration_s
+            data = self._http_get(self.LRCLIB_GET, params)
 
-        # Stage 2: Cleaned GET
+        # Stage 2: Cleaned title GET with duration
         if not data and cleaned_title and cleaned_title != title:
             params_clean = {"track_name": cleaned_title, "artist_name": artist}
             if duration_s > 0:
                 params_clean["duration"] = duration_s
             data = self._http_get(self.LRCLIB_GET, params_clean)
 
-        # Stage 3: Search endpoint fallback
+        # Stage 3: Cleaned title GET without duration
+        if not data and duration_s > 0:
+            params_nodur = {"track_name": cleaned_title if cleaned_title else title, "artist_name": artist}
+            data = self._http_get(self.LRCLIB_GET, params_nodur)
+
+        # Stage 4: Search endpoint fallback with candidate scoring & validation
         if not data:
             q_title = cleaned_title if cleaned_title else title
             search_params = {"track_name": q_title, "artist_name": artist}
             search_results = self._http_get_json(self.LRCLIB_SEARCH, search_params)
+
+            if not isinstance(search_results, list) or not search_results:
+                search_results = self._http_get_json(self.LRCLIB_SEARCH, {"q": f"{artist} {q_title}"})
+
             if isinstance(search_results, list) and search_results:
+                best_cand = None
+                best_score = -1
                 for candidate in search_results:
-                    if candidate.get("syncedLyrics"):
-                        data = candidate
-                        break
-                if not data and search_results:
-                    data = search_results[0]
+                    score = self._score_candidate(candidate, title, artist, duration_s)
+                    if score > best_score:
+                        best_score = score
+                        best_cand = candidate
+                if best_cand and best_score >= 100:
+                    data = best_cand
 
         if data:
             if data.get("instrumental"):
@@ -800,7 +873,9 @@ class DynamicIslandWindow(Gtk.Window):
         self._vol_blocked = False
         self._seek_blocked = False
 
-        self._last_lyric_line = ""
+        self._current_track_key = None
+        self._last_lyric_line = None
+        self._last_mini_lyric = None
         self._lyric_fade_progress = 1.0
 
         # Dynamic positioning state
@@ -886,6 +961,7 @@ class DynamicIslandWindow(Gtk.Window):
         self.connect("leave-notify-event", self._on_leave)
         self.connect("motion-notify-event", self._on_motion)
         self.connect("scroll-event", self._on_scroll)
+        self.connect("map-event", self._on_map_event)
 
         # Fixed canvas size
         self.resize(CANVAS_W, CANVAS_H)
@@ -894,7 +970,12 @@ class DynamicIslandWindow(Gtk.Window):
         self._update_geometry_and_position()
         self._bind_monitor_signals()
 
-    def _update_geometry_and_position(self):
+    def _on_map_event(self, widget, event):
+        # Force window repositioning after compositor maps the window
+        self._update_geometry_and_position(force=True)
+        return False
+
+    def _update_geometry_and_position(self, force: bool = False):
         display = Gdk.Display.get_default()
         if not display:
             return
@@ -915,7 +996,17 @@ class DynamicIslandWindow(Gtk.Window):
         # Horizontally center relative to monitor's workarea
         target_x = work.x + int((work.width - CANVAS_W) / 2)
 
-        if (target_x, target_y) != (self._current_pos_x, self._current_pos_y):
+        needs_move = force
+        if not needs_move:
+            gdk_win = self.get_window()
+            if gdk_win:
+                cur_x, cur_y = self.get_position()
+                if (cur_x, cur_y) != (target_x, target_y):
+                    needs_move = True
+            elif (target_x, target_y) != (self._current_pos_x, self._current_pos_y):
+                needs_move = True
+
+        if needs_move:
             self._current_pos_x = target_x
             self._current_pos_y = target_y
             self.move(target_x, target_y)
@@ -926,15 +1017,15 @@ class DynamicIslandWindow(Gtk.Window):
             return
 
         try:
-            display.connect("monitor-added", lambda *_: self._update_geometry_and_position())
-            display.connect("monitor-removed", lambda *_: self._update_geometry_and_position())
+            display.connect("monitor-added", lambda *_: self._update_geometry_and_position(force=True))
+            display.connect("monitor-removed", lambda *_: self._update_geometry_and_position(force=True))
         except Exception:
             pass
 
         try:
             screen = self.get_screen()
             if screen:
-                screen.connect("size-changed", lambda *_: self._update_geometry_and_position())
+                screen.connect("size-changed", lambda *_: self._update_geometry_and_position(force=True))
         except Exception:
             pass
 
@@ -943,9 +1034,9 @@ class DynamicIslandWindow(Gtk.Window):
             for i in range(n):
                 mon = display.get_monitor(i)
                 if mon:
-                    mon.connect("notify::workarea", lambda *_: self._update_geometry_and_position())
-                    mon.connect("notify::geometry", lambda *_: self._update_geometry_and_position())
-                    mon.connect("notify::scale-factor", lambda *_: self._update_geometry_and_position())
+                    mon.connect("notify::workarea", lambda *_: self._update_geometry_and_position(force=True))
+                    mon.connect("notify::geometry", lambda *_: self._update_geometry_and_position(force=True))
+                    mon.connect("notify::scale-factor", lambda *_: self._update_geometry_and_position(force=True))
         except Exception:
             pass
 
@@ -1434,6 +1525,11 @@ class DynamicIslandWindow(Gtk.Window):
         artist = self._last_info.get("artist") or ""
 
         if not title or status == "Stopped":
+            if self._last_lyric_line != "":
+                self._last_lyric_line = ""
+                self._last_mini_lyric = ""
+                self._mini_lyric.set_text("")
+                self._full_lyric_label.set_text("Open Spotify to play")
             return True
 
         pos_us = self.media.get_position_us()
@@ -1442,7 +1538,7 @@ class DynamicIslandWindow(Gtk.Window):
         next_lyric = l_state["next_line"]
         l_status = l_state["status"]
 
-        # Build expanded lyric text
+        # Build expanded and mini lyric text (never use artist or album as lyric text)
         if l_status == LyricsController.STATUS_SYNCED:
             if l_state["is_intro"]:
                 full_text = "• • •"
@@ -1455,16 +1551,17 @@ class DynamicIslandWindow(Gtk.Window):
                 mini_text = "• • •"
         elif l_status == LyricsController.STATUS_LOADING:
             full_text = "Searching lyrics..."
-            mini_text = artist
+            mini_text = "• • •"
         elif l_status == LyricsController.STATUS_INSTRUMENTAL:
             full_text = "Instrumental"
-            mini_text = artist
+            mini_text = "Instrumental"
         else:
-            full_text = "No synced lyrics"
-            mini_text = artist
+            full_text = "No synced lyrics available"
+            mini_text = ""
 
-        if full_text != self._last_lyric_line:
+        if full_text != self._last_lyric_line or mini_text != self._last_mini_lyric:
             self._last_lyric_line = full_text
+            self._last_mini_lyric = mini_text
             self._lyric_fade_progress = 0.0
             GLib.timeout_add(16, self._tick_lyric_fade)
 
@@ -1504,7 +1601,24 @@ class DynamicIslandWindow(Gtk.Window):
                     self.show_notification("🔋", "On Battery Power", f"{pct}% remaining")
             self._last_battery_state = curr_charging
 
-        has_music = bool(info["title"] and info["status"] != "Stopped")
+        has_music = bool(info.get("title") and info.get("status") != "Stopped")
+
+        # Track identity tracking to immediately clear stale lyrics on song change
+        title = info.get("title")
+        artist = info.get("artist") or ""
+        track_id = info.get("track_id") or "/"
+        current_track_key = f"{track_id}|{artist}|{title}" if has_music else None
+
+        if current_track_key != self._current_track_key:
+            self._current_track_key = current_track_key
+            self._last_lyric_line = None
+            self._last_mini_lyric = None
+            if has_music:
+                self._mini_lyric.set_text("• • •")
+                self._full_lyric_label.set_text("Searching lyrics...")
+            else:
+                self._mini_lyric.set_text("")
+                self._full_lyric_label.set_text("Open Spotify to play")
 
         # Update lyrics controller track with duration for exact match
         dur_s = info.get("length_us", 0) // 1_000_000
