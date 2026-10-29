@@ -45,27 +45,32 @@ import dbus.mainloop.glib
 CANVAS_W = 440              # Fixed transparent window canvas width
 CANVAS_H = 250              # Fixed transparent window canvas height
 
-IDLE_W = 180                # Resting camera notch cover
+IDLE_W = 180                # Resting camera notch cover (no media)
 IDLE_H = 30
 
-MINI_W = 320                # Two-line mini pill: title+badge / live lyric
-MINI_H = 42
+COMPACT_W = 240             # Compact playing/paused capsule (220-260 px target)
+COMPACT_H = 40              # (38-44 px target)
 
-FULL_W = 400                # Expanded music player
-FULL_H = 210
+EXPANDED_W = 380            # Expanded music player (360-400 px target)
+EXPANDED_H = 162            # (145-175 px target, with lyric line)
+EXPANDED_H_NOLYRIC = 142    # (145-175 px target, without lyric line)
 
-NOTIF_W = 300               # Transient notification pill
+EMPTY_EXPANDED_W = 220      # When expanded with no media playing
+EMPTY_EXPANDED_H = 50
+
+NOTIF_W = 260               # Transient notification pill
 NOTIF_H = 36
 
 MARGIN_TOP_SCREEN = 0       # Flush with screen top when top panel is hidden
 MARGIN_TOP_PANEL = 0        # Flush with bottom edge of top panel when present
 
-ANIM_DURATION_MS = 220      # Snappy 220ms macOS-like spring transition
+ANIM_DURATION_MS = 200      # 200ms smooth ease-out (160-230 ms target)
 ANIM_INTERVAL_MS = 16       # 60 FPS tick
-COLLAPSE_DELAY_MS = 550     # Collapse grace period after mouse leaves
+COLLAPSE_DELAY_MS = 500     # Collapse grace period after mouse leaves
 UPDATE_INTERVAL_MS = 1000   # Polling interval for battery/media stats
 LYRIC_TICK_MS = 150         # 150ms lyric sync polling
-ART_SIZE = 46               # Album art dimensions (px)
+ART_SIZE_COMPACT = 22       # Compact album art thumbnail (px)
+ART_SIZE_EXPANDED = 42      # Expanded album art dimensions (px)
 
 WATER_REMINDER_INTERVAL_MIN = 30   # Background water reminder interval
 
@@ -80,6 +85,8 @@ CSS = """
 window, .canvas-root {
     background-color: transparent;
     background: transparent;
+    border: none;
+    box-shadow: none;
 }
 
 /* ── IDLE STATE (Camera Notch Cover) ── */
@@ -93,206 +100,179 @@ window, .canvas-root {
     min-height: 6px;
 }
 .idle-text {
-    color: rgba(255, 255, 255, 0.50);
-    font-size: 10px;
+    color: #727279;
+    font-size: 10.5px;
     font-weight: 500;
     font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Inter", sans-serif;
-    letter-spacing: 0.2px;
+    letter-spacing: 0.1px;
 }
 
-/* ── MINI STATE (Resting Music Pill) ── */
-.mini-box {
-    padding: 4px 18px 5px 18px;
+/* ── EMPTY EXPANDED STATE (Hovered with no media) ── */
+.empty-box {
+    padding: 12px 20px;
 }
-.mini-icon {
-    color: #1ed760;
-    margin-right: 2px;
+.empty-text {
+    color: #727279;
+    font-size: 11px;
+    font-weight: 500;
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Inter", sans-serif;
 }
-.mini-title {
-    color: #ffffff;
+
+/* ── COMPACT MEDIA STATE (220-260px wide, 38-44px tall) ── */
+.compact-box {
+    padding: 5px 14px 5px 12px;
+}
+.compact-art {
+    border-radius: 5px;
+}
+.compact-art-placeholder {
+    background: #101012;
+    border-radius: 5px;
+    min-width: 22px;
+    min-height: 22px;
+}
+.compact-title {
+    color: #F5F5F7;
     font-size: 11px;
     font-weight: 600;
     font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Inter", sans-serif;
     letter-spacing: -0.15px;
 }
-.mini-sep {
-    color: rgba(255, 255, 255, 0.25);
-    font-size: 9px;
-    margin: 0 4px;
-}
-.mini-badge {
-    color: rgba(255, 255, 255, 0.75);
-    font-size: 9.5px;
-    font-weight: 600;
-    font-family: -apple-system, BlinkMacSystemFont, "SF Mono", monospace;
-}
-.mini-lyric {
-    color: rgba(255, 255, 255, 0.60);
+.compact-artist {
+    color: #A1A1A6;
     font-size: 9.5px;
     font-weight: 400;
     font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Inter", sans-serif;
-    font-style: italic;
-    letter-spacing: -0.1px;
 }
 
 /* ── TRANSIENT NOTIFICATION OVERLAY ── */
 .notif-box {
-    padding: 6px 18px;
+    padding: 6px 16px;
 }
 .notif-icon {
+    color: #F2F2F4;
     font-size: 12px;
-    margin-right: 8px;
+    margin-right: 6px;
 }
 .notif-title {
-    color: #ffffff;
+    color: #F5F5F7;
     font-size: 11px;
     font-weight: 600;
     font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Inter", sans-serif;
 }
 .notif-sub {
-    color: rgba(255, 255, 255, 0.60);
+    color: #A1A1A6;
     font-size: 10px;
     font-family: -apple-system, BlinkMacSystemFont, "SF Mono", monospace;
     margin-left: 6px;
 }
 
-/* ── EXPANDED MUSIC PLAYER VIEW ── */
+/* ── EXPANDED MUSIC PLAYER VIEW (360-400px wide, 145-175px tall) ── */
 .full-box {
-    padding: 10px 16px 10px 16px;
+    padding: 12px 18px 10px 18px;
 }
 
-/* Album Art */
+/* Row 1: Header */
 .album-art {
     border-radius: 8px;
 }
 .art-placeholder {
-    background: linear-gradient(135deg, #1c1c1e, #2c2c2e);
+    background: #101012;
     border-radius: 8px;
-    min-width: 46px;
-    min-height: 46px;
+    min-width: 42px;
+    min-height: 42px;
 }
 .art-click-area {
     border-radius: 8px;
 }
-
-/* Track Info */
 .full-title {
-    color: #ffffff;
-    font-size: 13px;
+    color: #F5F5F7;
+    font-size: 13.5px;
     font-weight: 600;
     font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Inter", sans-serif;
     letter-spacing: -0.2px;
 }
 .full-artist {
-    color: rgba(255, 255, 255, 0.50);
-    font-size: 10.5px;
+    color: #A1A1A6;
+    font-size: 11px;
     font-weight: 400;
     font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Inter", sans-serif;
-}
-.tws-chip {
-    background-color: rgba(255, 255, 255, 0.08);
-    border: 1px solid rgba(255, 255, 255, 0.06);
-    border-radius: 6px;
-    padding: 2px 7px;
-    color: rgba(255, 255, 255, 0.75);
-    font-size: 9.5px;
-    font-weight: 600;
-    font-family: -apple-system, BlinkMacSystemFont, "SF Mono", monospace;
 }
 
-/* Synced Lyric Capsule */
-.lyric-capsule {
-    background-color: rgba(255, 255, 255, 0.05);
-    border: 1px solid rgba(255, 255, 255, 0.04);
-    border-radius: 6px;
-    padding: 4px 10px;
-}
-.full-lyric-icon {
-    color: #1ed760;
-    font-size: 9px;
-    margin-right: 4px;
+/* Row 2: Subdued Lyric Preview */
+.lyric-row {
+    padding: 2px 0 2px 0;
 }
 .full-lyric {
-    color: rgba(255, 255, 255, 0.88);
-    font-size: 10.5px;
+    color: #A1A1A6;
+    font-size: 11px;
     font-weight: 400;
-    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Inter", sans-serif;
     font-style: italic;
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Inter", sans-serif;
     letter-spacing: -0.1px;
 }
 
-/* Seekbar & Timestamps */
+/* Row 3: Seekbar & Timestamps */
 .time-label {
-    color: rgba(255, 255, 255, 0.38);
-    font-size: 9px;
+    color: #727279;
+    font-size: 9.5px;
     font-weight: 500;
-    font-family: "SF Mono", "JetBrains Mono", monospace;
+    font-family: -apple-system, BlinkMacSystemFont, "SF Mono", "JetBrains Mono", monospace;
     letter-spacing: 0.2px;
 }
-
-/* Playback Controls */
-.ctrl-btn {
-    background: transparent;
-    border: none;
-    border-radius: 50%;
-    min-width: 28px;
-    min-height: 28px;
-    color: rgba(255, 255, 255, 0.72);
-    padding: 0;
-    transition: all 120ms ease;
-}
-.ctrl-btn:hover {
-    background-color: rgba(255, 255, 255, 0.12);
-    color: #ffffff;
-}
-.ctrl-btn-play {
-    background-color: rgba(255, 255, 255, 0.16);
-    border: none;
-    border-radius: 50%;
-    min-width: 34px;
-    min-height: 34px;
-    color: #ffffff;
-    padding: 0;
-    transition: all 120ms ease;
-}
-.ctrl-btn-play:hover {
-    background-color: rgba(255, 255, 255, 0.28);
-}
-
-/* Volume Slider */
 scale {
     padding: 0;
     margin: 0;
 }
 scale trough {
-    background-color: rgba(255, 255, 255, 0.10);
+    background-color: #343438;
     border-radius: 2px;
     min-height: 3px;
     border: none;
 }
 scale slider {
-    background-color: #ffffff;
+    background-color: #F5F5F7;
     border-radius: 50%;
-    min-width: 9px;
-    min-height: 9px;
+    min-width: 8px;
+    min-height: 8px;
     border: none;
-    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.5);
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.6);
 }
 .seek-slider highlight {
-    background-color: rgba(255, 255, 255, 0.82);
+    background-color: #D8D8DC;
     border-radius: 2px;
     min-height: 3px;
     border: none;
 }
-.vol-slider highlight {
-    background-color: rgba(255, 255, 255, 0.48);
-    border-radius: 2px;
-    min-height: 3px;
+
+/* Row 4: Playback Controls */
+.ctrl-btn {
+    background: transparent;
     border: none;
+    border-radius: 50%;
+    min-width: 32px;
+    min-height: 32px;
+    color: #F2F2F4;
+    padding: 0;
+    transition: all 120ms ease;
 }
-.slider-icon {
-    color: rgba(255, 255, 255, 0.38);
-    padding: 0 2px;
+.ctrl-btn:hover {
+    background-color: rgba(255, 255, 255, 0.10);
+    color: #ffffff;
+}
+.ctrl-btn-play {
+    background: transparent;
+    border: none;
+    border-radius: 50%;
+    min-width: 38px;
+    min-height: 38px;
+    color: #F2F2F4;
+    padding: 0;
+    transition: all 120ms ease;
+}
+.ctrl-btn-play:hover {
+    background-color: rgba(255, 255, 255, 0.14);
+    color: #ffffff;
 }
 """
 
@@ -321,6 +301,61 @@ def format_time(microseconds: int) -> str:
     return f"{m}:{s:02d}"
 
 # ─────────────────────────────────────────────────────────────
+#  MEDIA ACTIVITY EQUALIZER INDICATOR (Apple Music-style Wave)
+# ─────────────────────────────────────────────────────────────
+class MediaActivityIndicator(Gtk.DrawingArea):
+    def __init__(self, size=16):
+        super().__init__()
+        self.set_size_request(size, size)
+        self._playing = False
+        self._bars = [0.35, 0.35, 0.35]
+        self._phase = 0
+        self.connect("draw", self._on_draw)
+
+    def set_playing(self, is_playing: bool):
+        if self._playing != is_playing:
+            self._playing = is_playing
+            if not is_playing:
+                self._bars = [0.3, 0.3, 0.3]
+            self.queue_draw()
+
+    def tick(self):
+        if self._playing:
+            self._phase = (self._phase + 1) % 6
+            patterns = [
+                [0.35, 0.85, 0.50],
+                [0.65, 0.40, 0.90],
+                [0.90, 0.70, 0.40],
+                [0.75, 1.00, 0.65],
+                [0.45, 0.65, 0.85],
+                [0.55, 0.35, 0.55],
+            ]
+            self._bars = patterns[self._phase]
+            self.queue_draw()
+
+    def _on_draw(self, widget, cr):
+        w = widget.get_allocated_width()
+        h = widget.get_allocated_height()
+        cr.set_source_rgba(216/255.0, 216/255.0, 220/255.0, 0.90)  # #D8D8DC
+        bar_w = 2.0
+        gap = 2.0
+        total_w = 3 * bar_w + 2 * gap
+        start_x = (w - total_w) / 2.0
+        max_bar_h = h * 0.75
+
+        for i, frac in enumerate(self._bars):
+            bx = start_x + i * (bar_w + gap)
+            bh = max(2.5, frac * max_bar_h)
+            by = (h - bh) / 2.0
+            r = bar_w / 2.0
+            cr.new_sub_path()
+            cr.arc(bx + r, by + r, r, math.pi, 0)
+            cr.arc(bx + r, by + bh - r, r, 0, math.pi)
+            cr.close_path()
+            cr.fill()
+        return False
+
+# ─────────────────────────────────────────────────────────────
 #  MEDIA CONTROLLER (MPRIS / SPOTIFY + D-BUS SIGNALS)
 # ─────────────────────────────────────────────────────────────
 class MediaController:
@@ -330,7 +365,8 @@ class MediaController:
         self._props = None
         self._name = None
         self._cached_art_url = None
-        self._cached_pixbuf = None
+        self._cached_pixbuf_expanded = None
+        self._cached_pixbuf_compact = None
         self._on_change_callback = on_change_callback
         self._scan()
 
@@ -408,7 +444,8 @@ class MediaController:
             "status": "Stopped",
             "track_id": "/",
             "art_url": None,
-            "pixbuf": self._cached_pixbuf,
+            "pixbuf": self._cached_pixbuf_expanded,
+            "pixbuf_compact": self._cached_pixbuf_compact,
         }
         if not self.is_available():
             return default
@@ -438,7 +475,8 @@ class MediaController:
                 "status": status,
                 "track_id": track_id,
                 "art_url": art_url,
-                "pixbuf": self._cached_pixbuf,
+                "pixbuf": self._cached_pixbuf_expanded,
+                "pixbuf_compact": self._cached_pixbuf_compact,
             }
         except Exception:
             self._player = None
@@ -449,10 +487,13 @@ class MediaController:
         cache_file = "/tmp/dynamic_notch_art.jpg"
         try:
             urllib.request.urlretrieve(url, cache_file)
-            pb = GdkPixbuf.Pixbuf.new_from_file_at_scale(cache_file, ART_SIZE, ART_SIZE, True)
-            self._cached_pixbuf = round_corners_pixbuf(pb, radius=8)
+            pb_exp = GdkPixbuf.Pixbuf.new_from_file_at_scale(cache_file, ART_SIZE_EXPANDED, ART_SIZE_EXPANDED, True)
+            self._cached_pixbuf_expanded = round_corners_pixbuf(pb_exp, radius=8)
+            pb_comp = GdkPixbuf.Pixbuf.new_from_file_at_scale(cache_file, ART_SIZE_COMPACT, ART_SIZE_COMPACT, True)
+            self._cached_pixbuf_compact = round_corners_pixbuf(pb_comp, radius=5)
         except Exception:
-            self._cached_pixbuf = None
+            self._cached_pixbuf_expanded = None
+            self._cached_pixbuf_compact = None
 
     def play_pause(self):
         if self.is_available():
@@ -836,9 +877,10 @@ class LyricsController:
 # ─────────────────────────────────────────────────────────────
 class DynamicIslandWindow(Gtk.Window):
     STATE_IDLE = 0
-    STATE_MINI = 1
+    STATE_COMPACT = 1
     STATE_FULL = 2
     STATE_NOTIF = 3
+    STATE_EMPTY = 4
 
     def __init__(self):
         super().__init__(type=Gtk.WindowType.TOPLEVEL)
@@ -866,17 +908,15 @@ class DynamicIslandWindow(Gtk.Window):
         self._notif_timer = None
         self._water_reminder_timer = None
         self._seeking = False
-        self._vol_dragging = False
         self._last_info = {}
         self._last_battery_state = None
+        self._low_battery_notified = False
 
-        self._vol_blocked = False
         self._seek_blocked = False
 
         self._current_track_key = None
-        self._last_lyric_line = None
-        self._last_mini_lyric = None
-        self._lyric_fade_progress = 1.0
+        self._last_lyric_line = ""
+        self._has_lyrics = False
 
         # Dynamic positioning state
         self._current_pos_x = None
@@ -888,19 +928,28 @@ class DynamicIslandWindow(Gtk.Window):
 
         self.show_all()
         self._full_box.set_visible(False)
-        self._mini_box.set_visible(False)
+        self._compact_box.set_visible(False)
+        self._empty_box.set_visible(False)
         self._notif_box.set_visible(False)
         self._idle_box.set_visible(True)
         self._update_input_shape(IDLE_W, IDLE_H)
 
         GLib.timeout_add(UPDATE_INTERVAL_MS, self._on_tick)
         GLib.timeout_add(LYRIC_TICK_MS, self._on_lyric_tick)
+        GLib.timeout_add(120, self._on_activity_tick)
         self._on_tick()
 
         # Start background water reminder
         self._start_water_reminder()
 
         self.connect("delete-event", self._on_delete)
+
+    def _on_activity_tick(self):
+        if self._state == self.STATE_COMPACT and hasattr(self, "compact_activity"):
+            self.compact_activity.tick()
+        elif self._state == self.STATE_FULL and hasattr(self, "full_activity"):
+            self.full_activity.tick()
+        return True
 
     def _on_delete(self, *_):
         if self._water_reminder_timer:
@@ -1057,13 +1106,13 @@ class DynamicIslandWindow(Gtk.Window):
         px = (CANVAS_W - w) / 2.0
         py = 0.0
 
-        if h <= float(MINI_H):
+        if h <= float(COMPACT_H):
             r = h / 2.0
         else:
-            prog = (h - float(MINI_H)) / float(FULL_H - MINI_H)
+            prog = (h - float(COMPACT_H)) / float(EXPANDED_H - COMPACT_H)
             prog = max(0.0, min(1.0, prog))
             t_smooth = prog * prog * (3.0 - 2.0 * prog)
-            r = (float(MINI_H) / 2.0) + (26.0 - (float(MINI_H) / 2.0)) * t_smooth
+            r = (float(COMPACT_H) / 2.0) + (26.0 - (float(COMPACT_H) / 2.0)) * t_smooth
 
         cr.new_sub_path()
         cr.arc(px + w - r, py + r, r, -math.pi / 2, 0)
@@ -1072,14 +1121,14 @@ class DynamicIslandWindow(Gtk.Window):
         cr.arc(px + r, py + r, r, math.pi, 3 * math.pi / 2)
         cr.close_path()
 
-        # OLED Deep Black Base Fill
-        cr.set_source_rgba(0.04, 0.04, 0.05, 0.98)
+        # OLED Deep Black Base Fill (#050506, 0.98 alpha)
+        cr.set_source_rgba(5/255.0, 5/255.0, 6/255.0, 0.98)
         cr.fill_preserve()
 
         # Specular satin sheen on top rim
         cr.save()
         cr.clip_preserve()
-        sheen_h = min(h, 45.0)
+        sheen_h = min(h, 40.0)
         sheen = cairo.LinearGradient(px, py, px, py + sheen_h)
         sheen.add_color_stop_rgba(0.0, 1.0, 1.0, 1.0, 0.04)
         sheen.add_color_stop_rgba(1.0, 1.0, 1.0, 1.0, 0.0)
@@ -1087,11 +1136,11 @@ class DynamicIslandWindow(Gtk.Window):
         cr.paint()
         cr.restore()
 
-        # 3-stop macOS glass rim highlight
+        # 3-stop macOS glass rim highlight (#28282B, 0.85 alpha)
         rim = cairo.LinearGradient(px, py, px, py + h)
-        rim.add_color_stop_rgba(0.0, 1.0, 1.0, 1.0, 0.20)
-        rim.add_color_stop_rgba(0.4, 1.0, 1.0, 1.0, 0.09)
-        rim.add_color_stop_rgba(1.0, 1.0, 1.0, 1.0, 0.04)
+        rim.add_color_stop_rgba(0.0, 1.0, 1.0, 1.0, 0.18)
+        rim.add_color_stop_rgba(0.3, 40/255.0, 40/255.0, 43/255.0, 0.85)
+        rim.add_color_stop_rgba(1.0, 40/255.0, 40/255.0, 43/255.0, 0.50)
         cr.set_source(rim)
         cr.set_line_width(1.0)
         cr.stroke()
@@ -1115,7 +1164,7 @@ class DynamicIslandWindow(Gtk.Window):
         self._overlay.get_style_context().add_class("canvas-root")
         self.add(self._overlay)
 
-        # ── 1. IDLE VIEW (Camera Notch Cover) ──
+        # ── 1. IDLE VIEW (Camera Notch Cover: 180x30) ──
         self._idle_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         self._idle_box.get_style_context().add_class("idle-box")
         self._idle_box.set_halign(Gtk.Align.CENTER)
@@ -1133,45 +1182,68 @@ class DynamicIslandWindow(Gtk.Window):
         self._idle_box.pack_start(self._idle_label, False, False, 0)
         self._overlay.add_overlay(self._idle_box)
 
-        # ── 2. MINI COLLAPSED VIEW ──
-        self._mini_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
-        self._mini_box.get_style_context().add_class("mini-box")
-        self._mini_box.set_halign(Gtk.Align.CENTER)
-        self._mini_box.set_valign(Gtk.Align.START)
-        self._mini_box.set_size_request(MINI_W, MINI_H)
+        # ── 2. EMPTY EXPANDED VIEW (Hovered with no media: 220x50) ──
+        self._empty_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        self._empty_box.get_style_context().add_class("empty-box")
+        self._empty_box.set_halign(Gtk.Align.CENTER)
+        self._empty_box.set_valign(Gtk.Align.CENTER)
+        self._empty_box.set_size_request(EMPTY_EXPANDED_W, EMPTY_EXPANDED_H)
 
-        mini_top = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
-        mini_top.set_halign(Gtk.Align.CENTER)
-        self._mini_box.pack_start(mini_top, False, False, 0)
+        empty_label = Gtk.Label(label="No media playing")
+        empty_label.get_style_context().add_class("empty-text")
+        empty_label.set_valign(Gtk.Align.CENTER)
+        self._empty_box.pack_start(empty_label, True, True, 0)
+        self._overlay.add_overlay(self._empty_box)
 
-        self._mini_icon_img = Gtk.Image.new_from_icon_name("media-playback-start-symbolic", Gtk.IconSize.MENU)
-        self._mini_icon_img.get_style_context().add_class("mini-icon")
-        mini_top.pack_start(self._mini_icon_img, False, False, 0)
+        # ── 3. COMPACT PLAYING / PAUSED VIEW (240x40) ──
+        self._compact_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        self._compact_box.get_style_context().add_class("compact-box")
+        self._compact_box.set_halign(Gtk.Align.CENTER)
+        self._compact_box.set_valign(Gtk.Align.START)
+        self._compact_box.set_size_request(COMPACT_W, COMPACT_H)
 
-        self._mini_title = Gtk.Label(label="")
-        self._mini_title.get_style_context().add_class("mini-title")
-        self._mini_title.set_ellipsize(Pango.EllipsizeMode.END)
-        self._mini_title.set_max_width_chars(20)
-        mini_top.pack_start(self._mini_title, False, False, 0)
+        # 22x22 album art container
+        self.compact_art_image = Gtk.Image()
+        self.compact_art_image.get_style_context().add_class("compact-art")
+        self.compact_art_image.set_size_request(ART_SIZE_COMPACT, ART_SIZE_COMPACT)
 
-        self._mini_sep = Gtk.Label(label="·")
-        self._mini_sep.get_style_context().add_class("mini-sep")
-        mini_top.pack_start(self._mini_sep, False, False, 0)
+        self.compact_art_placeholder = Gtk.Box()
+        self.compact_art_placeholder.get_style_context().add_class("compact-art-placeholder")
+        self.compact_art_placeholder.set_size_request(ART_SIZE_COMPACT, ART_SIZE_COMPACT)
 
-        self._mini_badge = Gtk.Label(label="")
-        self._mini_badge.get_style_context().add_class("mini-badge")
-        mini_top.pack_start(self._mini_badge, False, False, 0)
+        self.compact_art_container = Gtk.Overlay()
+        self.compact_art_container.set_size_request(ART_SIZE_COMPACT, ART_SIZE_COMPACT)
+        self.compact_art_container.add(self.compact_art_placeholder)
+        self.compact_art_container.add_overlay(self.compact_art_image)
+        self.compact_art_container.set_valign(Gtk.Align.CENTER)
+        self._compact_box.pack_start(self.compact_art_container, False, False, 0)
 
-        # Single synced lyric line in mini view
-        self._mini_lyric = Gtk.Label(label="")
-        self._mini_lyric.get_style_context().add_class("mini-lyric")
-        self._mini_lyric.set_ellipsize(Pango.EllipsizeMode.END)
-        self._mini_lyric.set_max_width_chars(38)
-        self._mini_lyric.set_halign(Gtk.Align.CENTER)
-        self._mini_box.pack_start(self._mini_lyric, False, False, 0)
-        self._overlay.add_overlay(self._mini_box)
+        # Track metadata column (title + artist)
+        compact_info_col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1)
+        compact_info_col.set_valign(Gtk.Align.CENTER)
+        self._compact_box.pack_start(compact_info_col, True, True, 0)
 
-        # ── 3. TRANSIENT NOTIFICATION OVERLAY ──
+        self.compact_title = Gtk.Label(label="")
+        self.compact_title.get_style_context().add_class("compact-title")
+        self.compact_title.set_halign(Gtk.Align.START)
+        self.compact_title.set_ellipsize(Pango.EllipsizeMode.END)
+        self.compact_title.set_max_width_chars(18)
+        compact_info_col.pack_start(self.compact_title, False, False, 0)
+
+        self.compact_artist = Gtk.Label(label="")
+        self.compact_artist.get_style_context().add_class("compact-artist")
+        self.compact_artist.set_halign(Gtk.Align.START)
+        self.compact_artist.set_ellipsize(Pango.EllipsizeMode.END)
+        self.compact_artist.set_max_width_chars(20)
+        compact_info_col.pack_start(self.compact_artist, False, False, 0)
+
+        # 3-bar media activity equalizer wave
+        self.compact_activity = MediaActivityIndicator(size=14)
+        self.compact_activity.set_valign(Gtk.Align.CENTER)
+        self._compact_box.pack_end(self.compact_activity, False, False, 0)
+        self._overlay.add_overlay(self._compact_box)
+
+        # ── 4. TRANSIENT NOTIFICATION OVERLAY (260x36) ──
         self._notif_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
         self._notif_box.get_style_context().add_class("notif-box")
         self._notif_box.set_halign(Gtk.Align.CENTER)
@@ -1191,28 +1263,31 @@ class DynamicIslandWindow(Gtk.Window):
         self._notif_box.pack_start(self._notif_sub, False, False, 0)
         self._overlay.add_overlay(self._notif_box)
 
-        # ── 4. EXPANDED MUSIC PLAYER VIEW (no tabs) ──
-        self._full_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5)
+        # ── 5. EXPANDED MUSIC PLAYER VIEW (380x162 / 380x142) ──
+        self._full_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         self._full_box.get_style_context().add_class("full-box")
         self._full_box.set_halign(Gtk.Align.CENTER)
         self._full_box.set_valign(Gtk.Align.START)
-        self._full_box.set_size_request(FULL_W, FULL_H)
+        self._full_box.set_size_request(EXPANDED_W, EXPANDED_H)
         self._overlay.add_overlay(self._full_box)
 
         self._build_music_panel()
 
     # ── Music Player Panel ──
     def _build_music_panel(self):
-        # Header row: Album Art + Track Info + Battery chip
+        # Row 1: Header (Album Art + Track Metadata + Activity Wave)
         row_hdr = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
         self._full_box.pack_start(row_hdr, False, False, 0)
 
-        # Album art
+        # 42x42 album art
         self.art_image = Gtk.Image()
         self.art_image.get_style_context().add_class("album-art")
+        self.art_image.set_size_request(ART_SIZE_EXPANDED, ART_SIZE_EXPANDED)
         self.art_placeholder = Gtk.Box()
         self.art_placeholder.get_style_context().add_class("art-placeholder")
+        self.art_placeholder.set_size_request(ART_SIZE_EXPANDED, ART_SIZE_EXPANDED)
         self.art_container = Gtk.Overlay()
+        self.art_container.set_size_request(ART_SIZE_EXPANDED, ART_SIZE_EXPANDED)
         self.art_container.get_style_context().add_class("art-click-area")
         self.art_container.add(self.art_placeholder)
         self.art_container.add_overlay(self.art_image)
@@ -1239,30 +1314,25 @@ class DynamicIslandWindow(Gtk.Window):
         self.full_artist.set_max_width_chars(28)
         info_col.pack_start(self.full_artist, False, False, 0)
 
-        # Battery / TWS chip (top-right)
-        self.full_tws = Gtk.Label(label="")
-        self.full_tws.get_style_context().add_class("tws-chip")
-        self.full_tws.set_valign(Gtk.Align.CENTER)
-        row_hdr.pack_end(self.full_tws, False, False, 0)
+        # Full activity wave indicator (right side of header)
+        self.full_activity = MediaActivityIndicator(size=18)
+        self.full_activity.set_valign(Gtk.Align.CENTER)
+        row_hdr.pack_end(self.full_activity, False, False, 0)
 
-        # Synced Lyric Capsule (single line, no click-to-expand)
-        self._lyric_capsule = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
-        self._lyric_capsule.get_style_context().add_class("lyric-capsule")
-        self._full_box.pack_start(self._lyric_capsule, False, False, 0)
+        # Row 2: Subdued Lyric Preview (hidden when no lyrics)
+        self._lyric_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+        self._lyric_row.get_style_context().add_class("lyric-row")
+        self._full_box.pack_start(self._lyric_row, False, False, 0)
 
-        self._lyric_icon = Gtk.Label(label="♫")
-        self._lyric_icon.get_style_context().add_class("full-lyric-icon")
-        self._lyric_capsule.pack_start(self._lyric_icon, False, False, 0)
-
-        self._full_lyric_label = Gtk.Label(label="Listening to music...")
+        self._full_lyric_label = Gtk.Label(label="")
         self._full_lyric_label.get_style_context().add_class("full-lyric")
         self._full_lyric_label.set_ellipsize(Pango.EllipsizeMode.END)
         self._full_lyric_label.set_max_width_chars(44)
         self._full_lyric_label.set_halign(Gtk.Align.START)
-        self._lyric_capsule.pack_start(self._full_lyric_label, True, True, 0)
+        self._lyric_row.pack_start(self._full_lyric_label, True, True, 0)
 
-        # Seekbar row
-        row_seek = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        # Row 3: Seekbar & Timestamps
+        row_seek = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         self._full_box.pack_start(row_seek, False, False, 0)
 
         self.lbl_cur_time = Gtk.Label(label="0:00")
@@ -1277,12 +1347,12 @@ class DynamicIslandWindow(Gtk.Window):
         self.seek_scale.connect("value-changed", self._on_seek_changed)
         row_seek.pack_start(self.seek_scale, True, True, 0)
 
-        self.lbl_tot_time = Gtk.Label(label="0:00")
+        self.lbl_tot_time = Gtk.Label(label="-0:00")
         self.lbl_tot_time.get_style_context().add_class("time-label")
-        row_seek.pack_start(self.lbl_tot_time, False, False, 0)
+        row_seek.pack_end(self.lbl_tot_time, False, False, 0)
 
-        # Playback Controls row
-        row_ctrl = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=14)
+        # Row 4: Centered Playback Controls (Prev, Play/Pause, Next)
+        row_ctrl = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=18)
         row_ctrl.set_halign(Gtk.Align.CENTER)
         self._full_box.pack_start(row_ctrl, False, False, 0)
 
@@ -1305,30 +1375,10 @@ class DynamicIslandWindow(Gtk.Window):
         btn_next.connect("clicked", lambda *_: self.media.next())
         row_ctrl.pack_start(btn_next, False, False, 0)
 
-        # Volume slider row
-        row_vol = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-        self._full_box.pack_start(row_vol, False, False, 0)
-
-        vol_icon_lo = Gtk.Image.new_from_icon_name("audio-volume-low-symbolic", Gtk.IconSize.MENU)
-        vol_icon_lo.get_style_context().add_class("slider-icon")
-        row_vol.pack_start(vol_icon_lo, False, False, 0)
-
-        self.vol_scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 1.5, 0.01)
-        self.vol_scale.get_style_context().add_class("vol-slider")
-        self.vol_scale.set_draw_value(False)
-        self.vol_scale.connect("button-press-event", lambda *_: setattr(self, "_vol_dragging", True))
-        self.vol_scale.connect("button-release-event", lambda *_: setattr(self, "_vol_dragging", False))
-        self.vol_scale.connect("value-changed", self._on_vol_changed)
-        row_vol.pack_start(self.vol_scale, True, True, 0)
-
-        vol_icon_hi = Gtk.Image.new_from_icon_name("audio-volume-high-symbolic", Gtk.IconSize.MENU)
-        vol_icon_hi.get_style_context().add_class("slider-icon")
-        row_vol.pack_start(vol_icon_hi, False, False, 0)
-
     # ─────────────────────────────────────────────────────────
     #  TRANSIENT NOTIFICATIONS
     # ─────────────────────────────────────────────────────────
-    def show_notification(self, icon: str, title: str, subtitle: str = "", duration_s: float = 2.5):
+    def show_notification(self, icon: str, title: str, subtitle: str = "", duration_s: float = 1.2):
         self._notif_icon.set_text(icon)
         self._notif_title.set_text(title)
         self._notif_sub.set_text(subtitle)
@@ -1345,7 +1395,7 @@ class DynamicIslandWindow(Gtk.Window):
     def _dismiss_notification(self):
         self._notif_timer = None
         has_music = bool(self._last_info.get("title") and self._last_info.get("status") != "Stopped")
-        self._animate_to(self.STATE_MINI if has_music else self.STATE_IDLE)
+        self._animate_to(self.STATE_COMPACT if has_music else self.STATE_IDLE)
         return False
 
     # ─────────────────────────────────────────────────────────
@@ -1364,19 +1414,26 @@ class DynamicIslandWindow(Gtk.Window):
     # ─────────────────────────────────────────────────────────
     def _animate_to(self, target_state):
         if self._state == target_state and not self._anim_running:
-            return
+            if target_state != self.STATE_FULL:
+                return
+            expected_h = float(EXPANDED_H if self._has_lyrics else EXPANDED_H_NOLYRIC)
+            if self._current_h == expected_h:
+                return
 
         self._target_state = target_state
 
         if target_state == self.STATE_IDLE:
             target_w, target_h = float(IDLE_W), float(IDLE_H)
-        elif target_state == self.STATE_MINI:
-            target_w, target_h = float(MINI_W), float(MINI_H)
+        elif target_state == self.STATE_COMPACT:
+            target_w, target_h = float(COMPACT_W), float(COMPACT_H)
+            self._update_compact_ui()
         elif target_state == self.STATE_NOTIF:
             target_w, target_h = float(NOTIF_W), float(NOTIF_H)
+        elif target_state == self.STATE_EMPTY:
+            target_w, target_h = float(EMPTY_EXPANDED_W), float(EMPTY_EXPANDED_H)
         else:
-            target_w, target_h = float(FULL_W), float(FULL_H)
-            self._set_scale_val(self.vol_scale, self.vol.get(), "_vol_blocked")
+            target_h = float(EXPANDED_H if self._has_lyrics else EXPANDED_H_NOLYRIC)
+            target_w = float(EXPANDED_W)
             self._update_full_ui()
 
         self._start_w = self._current_w
@@ -1386,15 +1443,21 @@ class DynamicIslandWindow(Gtk.Window):
         self._anim_start_time = time.time() * 1000.0
 
         # Pre-activate target widget for seamless cross-fade
+        active_boxes = {
+            self.STATE_IDLE: self._idle_box,
+            self.STATE_COMPACT: self._compact_box,
+            self.STATE_NOTIF: self._notif_box,
+            self.STATE_EMPTY: self._empty_box,
+            self.STATE_FULL: self._full_box,
+        }
+        target_box = active_boxes.get(target_state)
+        if target_box:
+            target_box.set_visible(True)
+
         if target_state == self.STATE_FULL:
-            self._full_box.set_visible(True)
-            self._update_input_shape(FULL_W, FULL_H)
-        elif target_state == self.STATE_MINI:
-            self._mini_box.set_visible(True)
-        elif target_state == self.STATE_NOTIF:
-            self._notif_box.set_visible(True)
-        else:
-            self._idle_box.set_visible(True)
+            self._update_input_shape(EXPANDED_W, target_h)
+        elif target_state == self.STATE_EMPTY:
+            self._update_input_shape(EMPTY_EXPANDED_W, EMPTY_EXPANDED_H)
 
         if not self._anim_running:
             self._anim_running = True
@@ -1414,8 +1477,9 @@ class DynamicIslandWindow(Gtk.Window):
         # Cross-fade box opacities
         active_boxes = {
             self.STATE_IDLE: self._idle_box,
-            self.STATE_MINI: self._mini_box,
+            self.STATE_COMPACT: self._compact_box,
             self.STATE_NOTIF: self._notif_box,
+            self.STATE_EMPTY: self._empty_box,
             self.STATE_FULL: self._full_box,
         }
 
@@ -1446,9 +1510,10 @@ class DynamicIslandWindow(Gtk.Window):
 
             dim_map = {
                 self.STATE_IDLE: (IDLE_W, IDLE_H),
-                self.STATE_MINI: (MINI_W, MINI_H),
+                self.STATE_COMPACT: (COMPACT_W, COMPACT_H),
                 self.STATE_NOTIF: (NOTIF_W, NOTIF_H),
-                self.STATE_FULL: (FULL_W, FULL_H),
+                self.STATE_EMPTY: (EMPTY_EXPANDED_W, EMPTY_EXPANDED_H),
+                self.STATE_FULL: (EXPANDED_W, EXPANDED_H if self._has_lyrics else EXPANDED_H_NOLYRIC),
             }
             w, h = dim_map[self._state]
             self._update_input_shape(w, h)
@@ -1472,9 +1537,8 @@ class DynamicIslandWindow(Gtk.Window):
             return False
 
         self.vol.set(new_v)
-        self._set_scale_val(self.vol_scale, new_v, "_vol_blocked")
-        pct = int(new_v * 100)
-        self.show_notification("🔊", "Volume", f"{pct}%", duration_s=1.5)
+        pct = int(round(new_v * 100))
+        self.show_notification("🔊", "Volume", f"{pct}%", duration_s=1.2)
         return True
 
     def _on_enter(self, widget, event):
@@ -1483,22 +1547,26 @@ class DynamicIslandWindow(Gtk.Window):
         if self._collapse_timer:
             GLib.source_remove(self._collapse_timer)
             self._collapse_timer = None
-        if self._state != self.STATE_FULL:
-            self._animate_to(self.STATE_FULL)
+        has_music = bool(self._last_info.get("title") and self._last_info.get("status") != "Stopped")
+        target = self.STATE_FULL if has_music else self.STATE_EMPTY
+        if self._state != target:
+            self._animate_to(target)
         return False
 
     def _on_motion(self, widget, event):
         if self._collapse_timer:
             GLib.source_remove(self._collapse_timer)
             self._collapse_timer = None
-        if self._state != self.STATE_FULL and not self._anim_running:
-            self._animate_to(self.STATE_FULL)
+        has_music = bool(self._last_info.get("title") and self._last_info.get("status") != "Stopped")
+        target = self.STATE_FULL if has_music else self.STATE_EMPTY
+        if self._state != target and not self._anim_running:
+            self._animate_to(target)
         return False
 
     def _on_leave(self, widget, event):
         if event.detail == Gdk.NotifyType.INFERIOR:
             return False
-        if self._seeking or self._vol_dragging:
+        if self._seeking:
             return False
         if self._collapse_timer:
             GLib.source_remove(self._collapse_timer)
@@ -1507,10 +1575,10 @@ class DynamicIslandWindow(Gtk.Window):
 
     def _do_collapse(self):
         self._collapse_timer = None
-        if self._seeking or self._vol_dragging:
+        if self._seeking:
             return False
         has_music = bool(self._last_info.get("title") and self._last_info.get("status") != "Stopped")
-        self._animate_to(self.STATE_MINI if has_music else self.STATE_IDLE)
+        self._animate_to(self.STATE_COMPACT if has_music else self.STATE_IDLE)
         return False
 
     # ─────────────────────────────────────────────────────────
@@ -1522,62 +1590,50 @@ class DynamicIslandWindow(Gtk.Window):
 
         status = self._last_info.get("status", "Stopped")
         title = self._last_info.get("title")
-        artist = self._last_info.get("artist") or ""
 
         if not title or status == "Stopped":
-            if self._last_lyric_line != "":
-                self._last_lyric_line = ""
-                self._last_mini_lyric = ""
-                self._mini_lyric.set_text("")
-                self._full_lyric_label.set_text("Open Spotify to play")
+            if self._has_lyrics:
+                self._has_lyrics = False
+                self._lyric_row.set_visible(False)
+            self._last_lyric_line = ""
+            self._full_lyric_label.set_text("")
             return True
 
         pos_us = self.media.get_position_us()
         l_state = self.lyrics.get_state(pos_us)
         curr_lyric = l_state["current_line"]
-        next_lyric = l_state["next_line"]
         l_status = l_state["status"]
 
-        # Build expanded and mini lyric text (never use artist or album as lyric text)
-        if l_status == LyricsController.STATUS_SYNCED:
-            if l_state["is_intro"]:
-                full_text = "• • •"
-                mini_text = "• • •"
+        has_synced = (l_status == LyricsController.STATUS_SYNCED and bool(curr_lyric or l_state.get("is_intro")))
+        is_instrumental = (l_status == LyricsController.STATUS_INSTRUMENTAL)
+
+        should_show = has_synced or is_instrumental
+        if should_show != self._has_lyrics:
+            self._has_lyrics = should_show
+            self._lyric_row.set_visible(should_show)
+            if self._state == self.STATE_FULL and not self._anim_running:
+                target_h = float(EXPANDED_H if self._has_lyrics else EXPANDED_H_NOLYRIC)
+                self._current_h = target_h
+                self._update_input_shape(EXPANDED_W, target_h)
+                self.queue_draw()
+
+        if has_synced:
+            if l_state.get("is_intro"):
+                lyric_text = "• • •"
             elif curr_lyric:
-                full_text = f"\u201c{curr_lyric}\u201d"
-                mini_text = f"\u201c{curr_lyric}\u201d"
+                lyric_text = f"“{curr_lyric}”"
             else:
-                full_text = "• • •"
-                mini_text = "• • •"
-        elif l_status == LyricsController.STATUS_LOADING:
-            full_text = "Searching lyrics..."
-            mini_text = "• • •"
-        elif l_status == LyricsController.STATUS_INSTRUMENTAL:
-            full_text = "Instrumental"
-            mini_text = "Instrumental"
+                lyric_text = "• • •"
+        elif is_instrumental:
+            lyric_text = "Instrumental"
         else:
-            full_text = "No synced lyrics available"
-            mini_text = ""
+            lyric_text = ""
 
-        if full_text != self._last_lyric_line or mini_text != self._last_mini_lyric:
-            self._last_lyric_line = full_text
-            self._last_mini_lyric = mini_text
-            self._lyric_fade_progress = 0.0
-            GLib.timeout_add(16, self._tick_lyric_fade)
-
-            self._mini_lyric.set_text(mini_text)
-            self._mini_lyric.set_opacity(0.0)
-
-            self._full_lyric_label.set_text(full_text)
-            self._lyric_capsule.set_opacity(0.0)
+        if lyric_text != self._last_lyric_line:
+            self._last_lyric_line = lyric_text
+            self._full_lyric_label.set_text(lyric_text)
 
         return True
-
-    def _tick_lyric_fade(self):
-        self._lyric_fade_progress = min(1.0, self._lyric_fade_progress + 0.12)
-        self._mini_lyric.set_opacity(self._lyric_fade_progress)
-        self._lyric_capsule.set_opacity(self._lyric_fade_progress)
-        return self._lyric_fade_progress < 1.0
 
     # ─────────────────────────────────────────────────────────
     #  PERIODIC TICK (SPOTIFY METADATA + BATTERY NOTIFICATIONS)
@@ -1590,7 +1646,7 @@ class DynamicIslandWindow(Gtk.Window):
         tws = self.bt.get_info()
         self._last_info = info
 
-        # Battery power state transitions → transient notifications
+        # Battery power state transitions & low battery notifications
         if tws and tws.get("is_laptop"):
             curr_charging = tws.get("charging")
             pct = tws.get("percent", 0)
@@ -1599,6 +1655,11 @@ class DynamicIslandWindow(Gtk.Window):
                     self.show_notification("⚡", "Charger Connected", f"{pct}% battery")
                 else:
                     self.show_notification("🔋", "On Battery Power", f"{pct}% remaining")
+            elif not curr_charging and pct <= 20 and not self._low_battery_notified:
+                self._low_battery_notified = True
+                self.show_notification("⚠️", "Low Battery", f"{pct}% remaining")
+            elif pct > 20:
+                self._low_battery_notified = False
             self._last_battery_state = curr_charging
 
         has_music = bool(info.get("title") and info.get("status") != "Stopped")
@@ -1611,103 +1672,87 @@ class DynamicIslandWindow(Gtk.Window):
 
         if current_track_key != self._current_track_key:
             self._current_track_key = current_track_key
-            self._last_lyric_line = None
-            self._last_mini_lyric = None
-            if has_music:
-                self._mini_lyric.set_text("• • •")
-                self._full_lyric_label.set_text("Searching lyrics...")
-            else:
-                self._mini_lyric.set_text("")
-                self._full_lyric_label.set_text("Open Spotify to play")
+            self._last_lyric_line = ""
+            self._full_lyric_label.set_text("")
 
         # Update lyrics controller track with duration for exact match
         dur_s = info.get("length_us", 0) // 1_000_000
         self.lyrics.update_track(info.get("title"), info.get("artist"), info.get("album"), dur_s)
 
         # Auto-state transition when not hovered and not in notification
-        if not self._anim_running and self._state not in (self.STATE_FULL, self.STATE_NOTIF):
+        if not self._anim_running and self._state not in (self.STATE_FULL, self.STATE_EMPTY, self.STATE_NOTIF):
             if has_music and self._state == self.STATE_IDLE:
-                self._animate_to(self.STATE_MINI)
-            elif not has_music and self._state == self.STATE_MINI:
+                self._animate_to(self.STATE_COMPACT)
+            elif not has_music and self._state == self.STATE_COMPACT:
                 self._animate_to(self.STATE_IDLE)
 
-        # Update Mini UI
-        if has_music:
-            icon_name = "media-playback-pause-symbolic" if info["status"] == "Playing" else "media-playback-start-symbolic"
-            self._mini_icon_img.set_from_icon_name(icon_name, Gtk.IconSize.MENU)
-            self._mini_title.set_text(info["title"] or "")
-            if tws:
-                self._mini_sep.set_visible(True)
-                pct = tws["percent"]
-                if tws.get("is_laptop"):
-                    txt = f"⚡{pct}%" if tws.get("charging") else f"🔋{pct}%"
-                else:
-                    txt = f"🎧{pct}%" if pct >= 0 else f"🎧{tws['name']}"
-                self._mini_badge.set_text(txt)
-                self._mini_badge.set_visible(True)
-            else:
-                self._mini_sep.set_visible(False)
-                self._mini_badge.set_visible(False)
-
-        # Update Full UI if expanded
-        if self._state == self.STATE_FULL:
+        # Update UI according to active state
+        if self._state == self.STATE_COMPACT:
+            self._update_compact_ui()
+        elif self._state == self.STATE_FULL:
             self._update_full_ui()
 
         return True
+
+    def _update_compact_ui(self):
+        info = self._last_info
+        if not info:
+            return
+
+        is_playing = (info.get("status") == "Playing")
+        self.compact_activity.set_playing(is_playing)
+
+        title = info.get("title") or "Music"
+        artist = info.get("artist") or ""
+
+        self.compact_title.set_text(title)
+        self.compact_artist.set_text(artist)
+
+        pb = info.get("pixbuf_compact")
+        if pb:
+            self.compact_art_image.set_from_pixbuf(pb)
+            self.compact_art_image.set_visible(True)
+        else:
+            self.compact_art_image.set_visible(False)
 
     def _update_full_ui(self):
         info = self._last_info
         if not info:
             return
-        tws = self.bt.get_info()
+
+        is_playing = (info.get("status") == "Playing")
+        self.full_activity.set_playing(is_playing)
 
         # Track metadata
         self.full_title.set_text(info.get("title") or "Not Playing")
-
-        artist = info.get("artist") or "Open Spotify to play"
-        album = info.get("album")
-        if album and album != info.get("title") and info.get("title"):
-            subtitle = f"{artist} · {album}"
-        else:
-            subtitle = artist
-        self.full_artist.set_text(subtitle)
+        self.full_artist.set_text(info.get("artist") or "Open Spotify to play")
 
         # Play/pause icon
-        icon_name = "media-playback-pause-symbolic" if info.get("status") == "Playing" else "media-playback-start-symbolic"
+        icon_name = "media-playback-pause-symbolic" if is_playing else "media-playback-start-symbolic"
         self.play_icon.set_from_icon_name(icon_name, Gtk.IconSize.BUTTON)
 
-        # Album art
-        if info.get("pixbuf"):
-            self.art_image.set_from_pixbuf(info["pixbuf"])
+        # Album art (42x42)
+        pb = info.get("pixbuf")
+        if pb:
+            self.art_image.set_from_pixbuf(pb)
             self.art_image.set_visible(True)
         else:
             self.art_image.set_visible(False)
 
-        # Battery chip
-        if tws:
-            pct = tws["percent"]
-            if tws.get("is_laptop"):
-                txt = f"⚡ {pct}%" if tws.get("charging") else f"🔋 {pct}%"
-            else:
-                txt = f"🎧 {tws['name']} {pct}%" if pct >= 0 else f"🎧 {tws['name']}"
-            self.full_tws.set_text(txt)
-            self.full_tws.set_visible(True)
-        else:
-            self.full_tws.set_visible(False)
-
-        # Seekbar
+        # Seekbar & Remaining Time
         l_us = info.get("length_us", 0)
         p_us = info.get("position_us", 0)
         if l_us > 0 and not self._seeking:
             frac = min(1.0, max(0.0, p_us / float(l_us)))
             self._set_scale_val(self.seek_scale, frac, "_seek_blocked")
             self.lbl_cur_time.set_text(format_time(p_us))
-            self.lbl_tot_time.set_text(format_time(l_us))
+            rem_us = max(0, l_us - p_us)
+            self.lbl_tot_time.set_text(f"-{format_time(rem_us)}")
             self.seek_scale.set_sensitive(True)
         elif not self._seeking:
             self._set_scale_val(self.seek_scale, 0, "_seek_blocked")
             self.lbl_cur_time.set_text("0:00")
-            self.lbl_tot_time.set_text("0:00")
+            self.lbl_tot_time.set_text("-0:00")
             self.seek_scale.set_sensitive(False)
 
         return True
@@ -1738,10 +1783,8 @@ class DynamicIslandWindow(Gtk.Window):
             if length_us > 0:
                 pos = int(scale.get_value() * length_us)
                 self.lbl_cur_time.set_text(format_time(pos))
-
-    def _on_vol_changed(self, scale):
-        if not self._vol_blocked:
-            self.vol.set(scale.get_value())
+                rem_us = max(0, length_us - pos)
+                self.lbl_tot_time.set_text(f"-{format_time(rem_us)}")
 
 # ─────────────────────────────────────────────────────────────
 #  ENTRY POINT
