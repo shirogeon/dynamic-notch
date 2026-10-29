@@ -18,6 +18,8 @@ import os
 import sys
 import time
 import math
+import struct
+import shutil
 import json
 import re
 import glob
@@ -43,23 +45,23 @@ import dbus.mainloop.glib
 #  LAYOUT & TIMING CONSTANTS
 # ─────────────────────────────────────────────────────────────
 CANVAS_W = 440              # Fixed transparent window canvas width
-CANVAS_H = 250              # Fixed transparent window canvas height
+CANVAS_H = 220              # Fixed transparent window canvas height
 
 IDLE_W = 180                # Resting camera notch cover (no media)
 IDLE_H = 30
 
-COMPACT_W = 240             # Compact playing/paused capsule (220-260 px target)
-COMPACT_H = 40              # (38-44 px target)
+COMPACT_W = 280             # Compact playing/paused capsule (270-300 px target)
+COMPACT_H = 44              # (44-48 px target)
 
-EXPANDED_W = 380            # Expanded music player (360-400 px target)
-EXPANDED_H = 162            # (145-175 px target, with lyric line)
-EXPANDED_H_NOLYRIC = 142    # (145-175 px target, without lyric line)
+EXPANDED_W = 400            # Expanded music player (390-420 px target)
+EXPANDED_H = 168            # (155-180 px target, with lyric line)
+EXPANDED_H_NOLYRIC = 146    # (145-175 px target, without lyric line)
 
-EMPTY_EXPANDED_W = 220      # When expanded with no media playing
-EMPTY_EXPANDED_H = 50
+EMPTY_EXPANDED_W = 240      # When expanded with no media playing
+EMPTY_EXPANDED_H = 48
 
-NOTIF_W = 260               # Transient notification pill
-NOTIF_H = 36
+NOTIF_W = 280               # Transient notification pill
+NOTIF_H = 40
 
 MARGIN_TOP_SCREEN = 0       # Flush with screen top when top panel is hidden
 MARGIN_TOP_PANEL = 0        # Flush with bottom edge of top panel when present
@@ -69,8 +71,9 @@ ANIM_INTERVAL_MS = 16       # 60 FPS tick
 COLLAPSE_DELAY_MS = 500     # Collapse grace period after mouse leaves
 UPDATE_INTERVAL_MS = 1000   # Polling interval for battery/media stats
 LYRIC_TICK_MS = 150         # 150ms lyric sync polling
-ART_SIZE_COMPACT = 22       # Compact album art thumbnail (px)
-ART_SIZE_EXPANDED = 42      # Expanded album art dimensions (px)
+ACTIVITY_TICK_MS = 33       # ~30 FPS equalizer wave tick
+ART_SIZE_COMPACT = 28       # Compact album art thumbnail (px)
+ART_SIZE_EXPANDED = 44      # Expanded album art dimensions (px)
 
 WATER_REMINDER_INTERVAL_MIN = 30   # Background water reminder interval
 
@@ -100,7 +103,7 @@ window, .canvas-root {
     min-height: 6px;
 }
 .idle-text {
-    color: #727279;
+    color: #73737B;
     font-size: 10.5px;
     font-weight: 500;
     font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Inter", sans-serif;
@@ -112,35 +115,35 @@ window, .canvas-root {
     padding: 12px 20px;
 }
 .empty-text {
-    color: #727279;
+    color: #73737B;
     font-size: 11px;
     font-weight: 500;
     font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Inter", sans-serif;
 }
 
-/* ── COMPACT MEDIA STATE (220-260px wide, 38-44px tall) ── */
+/* ── COMPACT MEDIA STATE (280x44) ── */
 .compact-box {
-    padding: 5px 14px 5px 12px;
+    padding: 6px 14px 6px 12px;
 }
 .compact-art {
-    border-radius: 5px;
+    border-radius: 6px;
 }
 .compact-art-placeholder {
     background: #101012;
-    border-radius: 5px;
-    min-width: 22px;
-    min-height: 22px;
+    border-radius: 6px;
+    min-width: 28px;
+    min-height: 28px;
 }
 .compact-title {
-    color: #F5F5F7;
-    font-size: 11px;
+    color: #EEEEF0;
+    font-size: 11.5px;
     font-weight: 600;
     font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Inter", sans-serif;
     letter-spacing: -0.15px;
 }
 .compact-artist {
-    color: #A1A1A6;
-    font-size: 9.5px;
+    color: #A1A1A8;
+    font-size: 10px;
     font-weight: 400;
     font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Inter", sans-serif;
 }
@@ -150,26 +153,26 @@ window, .canvas-root {
     padding: 6px 16px;
 }
 .notif-icon {
-    color: #F2F2F4;
+    color: #EEEEF0;
     font-size: 12px;
     margin-right: 6px;
 }
 .notif-title {
-    color: #F5F5F7;
+    color: #EEEEF0;
     font-size: 11px;
     font-weight: 600;
     font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Inter", sans-serif;
 }
 .notif-sub {
-    color: #A1A1A6;
+    color: #A1A1A8;
     font-size: 10px;
     font-family: -apple-system, BlinkMacSystemFont, "SF Mono", monospace;
     margin-left: 6px;
 }
 
-/* ── EXPANDED MUSIC PLAYER VIEW (360-400px wide, 145-175px tall) ── */
+/* ── EXPANDED MUSIC PLAYER VIEW (400x168 / 400x146) ── */
 .full-box {
-    padding: 12px 18px 10px 18px;
+    padding: 14px 20px 12px 20px;
 }
 
 /* Row 1: Header */
@@ -179,21 +182,21 @@ window, .canvas-root {
 .art-placeholder {
     background: #101012;
     border-radius: 8px;
-    min-width: 42px;
-    min-height: 42px;
+    min-width: 44px;
+    min-height: 44px;
 }
 .art-click-area {
     border-radius: 8px;
 }
 .full-title {
-    color: #F5F5F7;
+    color: #EEEEF0;
     font-size: 13.5px;
     font-weight: 600;
     font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Inter", sans-serif;
     letter-spacing: -0.2px;
 }
 .full-artist {
-    color: #A1A1A6;
+    color: #A1A1A8;
     font-size: 11px;
     font-weight: 400;
     font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Inter", sans-serif;
@@ -204,7 +207,7 @@ window, .canvas-root {
     padding: 2px 0 2px 0;
 }
 .full-lyric {
-    color: #A1A1A6;
+    color: #A1A1A8;
     font-size: 11px;
     font-weight: 400;
     font-style: italic;
@@ -214,7 +217,7 @@ window, .canvas-root {
 
 /* Row 3: Seekbar & Timestamps */
 .time-label {
-    color: #727279;
+    color: #73737B;
     font-size: 9.5px;
     font-weight: 500;
     font-family: -apple-system, BlinkMacSystemFont, "SF Mono", "JetBrains Mono", monospace;
@@ -225,13 +228,13 @@ scale {
     margin: 0;
 }
 scale trough {
-    background-color: #343438;
+    background-color: #29292D;
     border-radius: 2px;
     min-height: 3px;
     border: none;
 }
 scale slider {
-    background-color: #F5F5F7;
+    background-color: #EEEEF0;
     border-radius: 50%;
     min-width: 8px;
     min-height: 8px;
@@ -239,40 +242,48 @@ scale slider {
     box-shadow: 0 1px 3px rgba(0, 0, 0, 0.6);
 }
 .seek-slider highlight {
-    background-color: #D8D8DC;
+    background-color: #EEEEF0;
     border-radius: 2px;
     min-height: 3px;
     border: none;
 }
 
-/* Row 4: Playback Controls */
-.ctrl-btn {
+/* Row 4: Playback Controls (AC-05: Minimal glyphs, no discs, no borders) */
+button.ctrl-btn,
+button.ctrl-btn:backdrop,
+button.ctrl-btn:disabled,
+button.ctrl-btn-play,
+button.ctrl-btn-play:backdrop,
+button.ctrl-btn-play:disabled {
     background: transparent;
+    background-color: transparent;
+    background-image: none;
     border: none;
+    border-color: transparent;
     border-radius: 50%;
-    min-width: 32px;
-    min-height: 32px;
-    color: #F2F2F4;
+    box-shadow: none;
+    outline: none;
     padding: 0;
-    transition: all 120ms ease;
+    color: #EEEEF0;
+    -gtk-icon-shadow: none;
 }
-.ctrl-btn:hover {
-    background-color: rgba(255, 255, 255, 0.10);
-    color: #ffffff;
+button.ctrl-btn {
+    min-width: 34px;
+    min-height: 34px;
+    transition: background-color 120ms ease;
 }
-.ctrl-btn-play {
-    background: transparent;
-    border: none;
-    border-radius: 50%;
-    min-width: 38px;
-    min-height: 38px;
-    color: #F2F2F4;
-    padding: 0;
-    transition: all 120ms ease;
+button.ctrl-btn:hover {
+    background-color: rgba(255, 255, 255, 0.08);
+    color: #FFFFFF;
 }
-.ctrl-btn-play:hover {
-    background-color: rgba(255, 255, 255, 0.14);
-    color: #ffffff;
+button.ctrl-btn-play {
+    min-width: 36px;
+    min-height: 36px;
+    transition: background-color 120ms ease;
+}
+button.ctrl-btn-play:hover {
+    background-color: rgba(255, 255, 255, 0.12);
+    color: #FFFFFF;
 }
 """
 
@@ -301,42 +312,184 @@ def format_time(microseconds: int) -> str:
     return f"{m}:{s:02d}"
 
 # ─────────────────────────────────────────────────────────────
+#  PIPEWIRE AUDIO LEVEL MONITOR (Audio-Reactive Equalizer)
+# ─────────────────────────────────────────────────────────────
+class AudioLevelMonitor:
+    """Captures real-time audio from default PipeWire audio sink monitor stream.
+    Computes 3-band energy (Bass ~160Hz, Mid ~800Hz, Treble ~2400Hz) using Goertzel algorithm.
+    Thread-safe, non-blocking, with graceful fallback.
+    """
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._levels = [0.25, 0.25, 0.25]
+        self._is_playing = False
+        self._running = True
+        self._source_name = "Initializing..."
+        self._thread = threading.Thread(target=self._worker, daemon=True)
+        self._thread.start()
+
+    def set_playing(self, playing: bool):
+        with self._lock:
+            self._is_playing = playing
+
+    def get_levels(self) -> list:
+        with self._lock:
+            return list(self._levels)
+
+    def get_source_name(self) -> str:
+        with self._lock:
+            return self._source_name
+
+    def stop(self):
+        self._running = False
+
+    def _worker(self):
+        pw_path = shutil.which("pw-record")
+        if not pw_path:
+            with self._lock:
+                self._source_name = "Pseudo-reactive fallback (pw-record not installed)"
+            self._fallback_loop()
+            return
+
+        cmd = [
+            pw_path,
+            "--target", "@DEFAULT_AUDIO_SINK@",
+            "--rate", "8000",
+            "--channels", "1",
+            "--format", "s16",
+            "--raw", "-"
+        ]
+
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                bufsize=1024
+            )
+            with self._lock:
+                self._source_name = "PipeWire monitor stream (@DEFAULT_AUDIO_SINK@)"
+        except Exception as e:
+            with self._lock:
+                self._source_name = f"Fallback ({e})"
+            self._fallback_loop()
+            return
+
+        def goertzel(samples, target_freq, sample_rate=8000):
+            N = len(samples)
+            k = int(0.5 + (N * target_freq) / sample_rate)
+            omega = (2.0 * math.pi * k) / N
+            coeff = 2.0 * math.cos(omega)
+            s_prev = 0.0
+            s_prev2 = 0.0
+            for x in samples:
+                s = x + coeff * s_prev - s_prev2
+                s_prev2 = s_prev
+                s_prev = s
+            return max(0.0, s_prev2 * s_prev2 + s_prev * s_prev - coeff * s_prev * s_prev2)
+
+        peaks = [1e6, 1e6, 1e6]
+        cur_levels = [0.25, 0.25, 0.25]
+        chunk_bytes = 512  # 256 samples of 16-bit PCM = 32ms
+
+        while self._running:
+            try:
+                raw = proc.stdout.read(chunk_bytes)
+                if not raw or len(raw) < chunk_bytes:
+                    time.sleep(0.02)
+                    continue
+
+                samples = struct.unpack("<256h", raw)
+                rms = math.sqrt(sum(s * s for s in samples) / 256.0)
+
+                with self._lock:
+                    is_play = self._is_playing
+
+                if not is_play or rms < 45.0:
+                    # Settle to static resting bars
+                    for j in range(3):
+                        cur_levels[j] = cur_levels[j] * 0.88 + 0.25 * 0.12
+                else:
+                    powers = [
+                        goertzel(samples, 160),   # Bass (~160 Hz)
+                        goertzel(samples, 800),   # Mid (~800 Hz)
+                        goertzel(samples, 2400)   # Treble (~2400 Hz)
+                    ]
+                    for j in range(3):
+                        peaks[j] = max(powers[j], peaks[j] * 0.992)
+                        raw_norm = math.sqrt(powers[j] / max(peaks[j], 1.0))
+                        target = 0.15 + 0.85 * min(1.0, max(0.0, raw_norm ** 0.72))
+                        # Attack / decay filter
+                        if target > cur_levels[j]:
+                            cur_levels[j] = cur_levels[j] * 0.35 + target * 0.65
+                        else:
+                            cur_levels[j] = cur_levels[j] * 0.84 + target * 0.16
+
+                with self._lock:
+                    self._levels = list(cur_levels)
+
+            except Exception:
+                time.sleep(0.05)
+
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+
+    def _fallback_loop(self):
+        cur_levels = [0.25, 0.25, 0.25]
+        t = 0.0
+        while self._running:
+            time.sleep(0.033)
+            t += 0.033
+            with self._lock:
+                is_play = self._is_playing
+            if not is_play:
+                for j in range(3):
+                    cur_levels[j] = cur_levels[j] * 0.88 + 0.25 * 0.12
+            else:
+                targets = [
+                    0.25 + 0.65 * (math.sin(t * 8.0) ** 2),
+                    0.20 + 0.75 * (math.sin(t * 12.0 + 1.2) ** 2),
+                    0.25 + 0.60 * (math.sin(t * 16.0 + 2.5) ** 2),
+                ]
+                for j in range(3):
+                    cur_levels[j] = cur_levels[j] * 0.4 + targets[j] * 0.6
+            with self._lock:
+                self._levels = list(cur_levels)
+
+# ─────────────────────────────────────────────────────────────
 #  MEDIA ACTIVITY EQUALIZER INDICATOR (Apple Music-style Wave)
 # ─────────────────────────────────────────────────────────────
 class MediaActivityIndicator(Gtk.DrawingArea):
-    def __init__(self, size=16):
+    def __init__(self, size=16, monitor: AudioLevelMonitor = None):
         super().__init__()
         self.set_size_request(size, size)
+        self._size = size
         self._playing = False
-        self._bars = [0.35, 0.35, 0.35]
-        self._phase = 0
+        self._bars = [0.25, 0.25, 0.25]
+        self._monitor = monitor
         self.connect("draw", self._on_draw)
 
+    def set_monitor(self, monitor: AudioLevelMonitor):
+        self._monitor = monitor
+
     def set_playing(self, is_playing: bool):
-        if self._playing != is_playing:
-            self._playing = is_playing
-            if not is_playing:
-                self._bars = [0.3, 0.3, 0.3]
-            self.queue_draw()
+        self._playing = is_playing
+        if not is_playing:
+            self._bars = [0.25, 0.25, 0.25]
+        self.queue_draw()
 
     def tick(self):
-        if self._playing:
-            self._phase = (self._phase + 1) % 6
-            patterns = [
-                [0.35, 0.85, 0.50],
-                [0.65, 0.40, 0.90],
-                [0.90, 0.70, 0.40],
-                [0.75, 1.00, 0.65],
-                [0.45, 0.65, 0.85],
-                [0.55, 0.35, 0.55],
-            ]
-            self._bars = patterns[self._phase]
+        if self._monitor:
+            self._bars = self._monitor.get_levels()
             self.queue_draw()
 
     def _on_draw(self, widget, cr):
         w = widget.get_allocated_width()
         h = widget.get_allocated_height()
-        cr.set_source_rgba(216/255.0, 216/255.0, 220/255.0, 0.90)  # #D8D8DC
+        # AC-07: Silver-white equalizer bars (#EEEEF0)
+        cr.set_source_rgba(238/255.0, 238/255.0, 240/255.0, 0.95)
         bar_w = 2.0
         gap = 2.0
         total_w = 3 * bar_w + 2 * gap
@@ -490,7 +643,7 @@ class MediaController:
             pb_exp = GdkPixbuf.Pixbuf.new_from_file_at_scale(cache_file, ART_SIZE_EXPANDED, ART_SIZE_EXPANDED, True)
             self._cached_pixbuf_expanded = round_corners_pixbuf(pb_exp, radius=8)
             pb_comp = GdkPixbuf.Pixbuf.new_from_file_at_scale(cache_file, ART_SIZE_COMPACT, ART_SIZE_COMPACT, True)
-            self._cached_pixbuf_compact = round_corners_pixbuf(pb_comp, radius=5)
+            self._cached_pixbuf_compact = round_corners_pixbuf(pb_comp, radius=6)
         except Exception:
             self._cached_pixbuf_expanded = None
             self._cached_pixbuf_compact = None
@@ -922,6 +1075,9 @@ class DynamicIslandWindow(Gtk.Window):
         self._current_pos_x = None
         self._current_pos_y = None
 
+        # Real PipeWire Audio-Reactive Equalizer Monitor
+        self._audio_monitor = AudioLevelMonitor()
+
         self._setup_window()
         self._build_ui()
         self._apply_css()
@@ -936,7 +1092,7 @@ class DynamicIslandWindow(Gtk.Window):
 
         GLib.timeout_add(UPDATE_INTERVAL_MS, self._on_tick)
         GLib.timeout_add(LYRIC_TICK_MS, self._on_lyric_tick)
-        GLib.timeout_add(120, self._on_activity_tick)
+        GLib.timeout_add(ACTIVITY_TICK_MS, self._on_activity_tick)
         self._on_tick()
 
         # Start background water reminder
@@ -952,6 +1108,8 @@ class DynamicIslandWindow(Gtk.Window):
         return True
 
     def _on_delete(self, *_):
+        if hasattr(self, "_audio_monitor") and self._audio_monitor:
+            self._audio_monitor.stop()
         if self._water_reminder_timer:
             GLib.source_remove(self._water_reminder_timer)
             self._water_reminder_timer = None
@@ -1112,7 +1270,7 @@ class DynamicIslandWindow(Gtk.Window):
             prog = (h - float(COMPACT_H)) / float(EXPANDED_H - COMPACT_H)
             prog = max(0.0, min(1.0, prog))
             t_smooth = prog * prog * (3.0 - 2.0 * prog)
-            r = (float(COMPACT_H) / 2.0) + (26.0 - (float(COMPACT_H) / 2.0)) * t_smooth
+            r = (float(COMPACT_H) / 2.0) + (28.0 - (float(COMPACT_H) / 2.0)) * t_smooth
 
         cr.new_sub_path()
         cr.arc(px + w - r, py + r, r, -math.pi / 2, 0)
@@ -1121,8 +1279,8 @@ class DynamicIslandWindow(Gtk.Window):
         cr.arc(px + r, py + r, r, math.pi, 3 * math.pi / 2)
         cr.close_path()
 
-        # OLED Deep Black Base Fill (#050506, 0.98 alpha)
-        cr.set_source_rgba(5/255.0, 5/255.0, 6/255.0, 0.98)
+        # OLED Deep Black Base Fill (#050506, 1.0 alpha - completely opaque inside squircle)
+        cr.set_source_rgba(5/255.0, 5/255.0, 6/255.0, 1.0)
         cr.fill_preserve()
 
         # Specular satin sheen on top rim
@@ -1136,11 +1294,11 @@ class DynamicIslandWindow(Gtk.Window):
         cr.paint()
         cr.restore()
 
-        # 3-stop macOS glass rim highlight (#28282B, 0.85 alpha)
+        # Subtle macOS dark glass rim highlight (#29292D)
         rim = cairo.LinearGradient(px, py, px, py + h)
-        rim.add_color_stop_rgba(0.0, 1.0, 1.0, 1.0, 0.18)
-        rim.add_color_stop_rgba(0.3, 40/255.0, 40/255.0, 43/255.0, 0.85)
-        rim.add_color_stop_rgba(1.0, 40/255.0, 40/255.0, 43/255.0, 0.50)
+        rim.add_color_stop_rgba(0.0, 1.0, 1.0, 1.0, 0.14)
+        rim.add_color_stop_rgba(0.25, 41/255.0, 41/255.0, 45/255.0, 0.90)
+        rim.add_color_stop_rgba(1.0, 41/255.0, 41/255.0, 45/255.0, 0.40)
         cr.set_source(rim)
         cr.set_line_width(1.0)
         cr.stroke()
@@ -1227,18 +1385,18 @@ class DynamicIslandWindow(Gtk.Window):
         self.compact_title.get_style_context().add_class("compact-title")
         self.compact_title.set_halign(Gtk.Align.START)
         self.compact_title.set_ellipsize(Pango.EllipsizeMode.END)
-        self.compact_title.set_max_width_chars(18)
+        self.compact_title.set_max_width_chars(20)
         compact_info_col.pack_start(self.compact_title, False, False, 0)
 
         self.compact_artist = Gtk.Label(label="")
         self.compact_artist.get_style_context().add_class("compact-artist")
         self.compact_artist.set_halign(Gtk.Align.START)
         self.compact_artist.set_ellipsize(Pango.EllipsizeMode.END)
-        self.compact_artist.set_max_width_chars(20)
+        self.compact_artist.set_max_width_chars(22)
         compact_info_col.pack_start(self.compact_artist, False, False, 0)
 
         # 3-bar media activity equalizer wave
-        self.compact_activity = MediaActivityIndicator(size=14)
+        self.compact_activity = MediaActivityIndicator(size=14, monitor=self._audio_monitor)
         self.compact_activity.set_valign(Gtk.Align.CENTER)
         self._compact_box.pack_end(self.compact_activity, False, False, 0)
         self._overlay.add_overlay(self._compact_box)
@@ -1304,18 +1462,18 @@ class DynamicIslandWindow(Gtk.Window):
         self.full_title.get_style_context().add_class("full-title")
         self.full_title.set_halign(Gtk.Align.START)
         self.full_title.set_ellipsize(Pango.EllipsizeMode.END)
-        self.full_title.set_max_width_chars(24)
+        self.full_title.set_max_width_chars(26)
         info_col.pack_start(self.full_title, False, False, 0)
 
         self.full_artist = Gtk.Label(label="Open Spotify to play")
         self.full_artist.get_style_context().add_class("full-artist")
         self.full_artist.set_halign(Gtk.Align.START)
         self.full_artist.set_ellipsize(Pango.EllipsizeMode.END)
-        self.full_artist.set_max_width_chars(28)
+        self.full_artist.set_max_width_chars(30)
         info_col.pack_start(self.full_artist, False, False, 0)
 
         # Full activity wave indicator (right side of header)
-        self.full_activity = MediaActivityIndicator(size=18)
+        self.full_activity = MediaActivityIndicator(size=18, monitor=self._audio_monitor)
         self.full_activity.set_valign(Gtk.Align.CENTER)
         row_hdr.pack_end(self.full_activity, False, False, 0)
 
@@ -1327,7 +1485,7 @@ class DynamicIslandWindow(Gtk.Window):
         self._full_lyric_label = Gtk.Label(label="")
         self._full_lyric_label.get_style_context().add_class("full-lyric")
         self._full_lyric_label.set_ellipsize(Pango.EllipsizeMode.END)
-        self._full_lyric_label.set_max_width_chars(44)
+        self._full_lyric_label.set_max_width_chars(46)
         self._full_lyric_label.set_halign(Gtk.Align.START)
         self._lyric_row.pack_start(self._full_lyric_label, True, True, 0)
 
@@ -1351,27 +1509,38 @@ class DynamicIslandWindow(Gtk.Window):
         self.lbl_tot_time.get_style_context().add_class("time-label")
         row_seek.pack_end(self.lbl_tot_time, False, False, 0)
 
-        # Row 4: Centered Playback Controls (Prev, Play/Pause, Next)
-        row_ctrl = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=18)
+        # Row 4: Centered Playback Controls (AC-05: Minimal glyphs, no discs, no borders)
+        row_ctrl = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=20)
         row_ctrl.set_halign(Gtk.Align.CENTER)
         self._full_box.pack_start(row_ctrl, False, False, 0)
 
         btn_prev = Gtk.Button()
+        btn_prev.set_relief(Gtk.ReliefStyle.NONE)
+        btn_prev.set_focus_on_click(False)
         btn_prev.get_style_context().add_class("ctrl-btn")
-        btn_prev.set_image(Gtk.Image.new_from_icon_name("media-skip-backward-symbolic", Gtk.IconSize.BUTTON))
+        img_prev = Gtk.Image.new_from_icon_name("media-skip-backward-symbolic", Gtk.IconSize.BUTTON)
+        img_prev.set_pixel_size(18)
+        btn_prev.set_image(img_prev)
         btn_prev.connect("clicked", lambda *_: self.media.prev())
         row_ctrl.pack_start(btn_prev, False, False, 0)
 
         self.btn_play = Gtk.Button()
+        self.btn_play.set_relief(Gtk.ReliefStyle.NONE)
+        self.btn_play.set_focus_on_click(False)
         self.btn_play.get_style_context().add_class("ctrl-btn-play")
         self.play_icon = Gtk.Image.new_from_icon_name("media-playback-start-symbolic", Gtk.IconSize.BUTTON)
+        self.play_icon.set_pixel_size(20)
         self.btn_play.set_image(self.play_icon)
         self.btn_play.connect("clicked", lambda *_: self.media.play_pause())
         row_ctrl.pack_start(self.btn_play, False, False, 0)
 
         btn_next = Gtk.Button()
+        btn_next.set_relief(Gtk.ReliefStyle.NONE)
+        btn_next.set_focus_on_click(False)
         btn_next.get_style_context().add_class("ctrl-btn")
-        btn_next.set_image(Gtk.Image.new_from_icon_name("media-skip-forward-symbolic", Gtk.IconSize.BUTTON))
+        img_next = Gtk.Image.new_from_icon_name("media-skip-forward-symbolic", Gtk.IconSize.BUTTON)
+        img_next.set_pixel_size(18)
+        btn_next.set_image(img_next)
         btn_next.connect("clicked", lambda *_: self.media.next())
         row_ctrl.pack_start(btn_next, False, False, 0)
 
@@ -1663,6 +1832,9 @@ class DynamicIslandWindow(Gtk.Window):
             self._last_battery_state = curr_charging
 
         has_music = bool(info.get("title") and info.get("status") != "Stopped")
+        is_playing = (info.get("status") == "Playing")
+        if hasattr(self, "_audio_monitor") and self._audio_monitor:
+            self._audio_monitor.set_playing(is_playing)
 
         # Track identity tracking to immediately clear stale lyrics on song change
         title = info.get("title")
@@ -1730,6 +1902,7 @@ class DynamicIslandWindow(Gtk.Window):
         # Play/pause icon
         icon_name = "media-playback-pause-symbolic" if is_playing else "media-playback-start-symbolic"
         self.play_icon.set_from_icon_name(icon_name, Gtk.IconSize.BUTTON)
+        self.play_icon.set_pixel_size(20)
 
         # Album art (42x42)
         pb = info.get("pixbuf")
