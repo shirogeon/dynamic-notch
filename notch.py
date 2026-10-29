@@ -78,7 +78,7 @@ CINEMA_POLL_MS = 200        # Cinema mode fullscreen poll interval
 ART_SIZE_COMPACT = 28       # Compact album art thumbnail (px)
 ART_SIZE_EXPANDED = 44      # Expanded album art dimensions (px)
 
-WATER_REMINDER_INTERVAL_MIN = 30   # Background water reminder interval
+WATER_REMINDER_INTERVAL_MIN = 5   # Background water reminder interval
 
 CONFIG_DIR = os.path.expanduser("~/.config/dynamic-notch")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
