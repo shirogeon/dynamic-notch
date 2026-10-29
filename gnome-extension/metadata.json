@@ -1,0 +1,16 @@
+{
+  "name": "Dynamic Notch Cinema Bridge",
+  "description": "Reports monitor fullscreen state to Dynamic Notch via session D-Bus for cinema suppression",
+  "uuid": "cinema-bridge@dynamic-notch",
+  "shell-version": [
+    "45",
+    "46",
+    "47",
+    "48",
+    "49",
+    "50",
+    "51"
+  ],
+  "url": "https://github.com/notch-test",
+  "version": 1
+}

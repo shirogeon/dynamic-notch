@@ -20,6 +20,8 @@ import time
 import math
 import struct
 import shutil
+import ctypes
+from ctypes import c_int, c_ulong, POINTER, byref
 import json
 import re
 import glob
@@ -72,6 +74,7 @@ COLLAPSE_DELAY_MS = 500     # Collapse grace period after mouse leaves
 UPDATE_INTERVAL_MS = 1000   # Polling interval for battery/media stats
 LYRIC_TICK_MS = 150         # 150ms lyric sync polling
 ACTIVITY_TICK_MS = 33       # ~30 FPS equalizer wave tick
+CINEMA_POLL_MS = 200        # Cinema mode fullscreen poll interval
 ART_SIZE_COMPACT = 28       # Compact album art thumbnail (px)
 ART_SIZE_EXPANDED = 44      # Expanded album art dimensions (px)
 
@@ -135,15 +138,15 @@ window, .canvas-root {
     min-height: 28px;
 }
 .compact-title {
-    color: #EEEEF0;
-    font-size: 11.5px;
+    color: #F5F5F7;
+    font-size: 12px;
     font-weight: 600;
     font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Inter", sans-serif;
     letter-spacing: -0.15px;
 }
 .compact-artist {
     color: #A1A1A8;
-    font-size: 10px;
+    font-size: 10.5px;
     font-weight: 400;
     font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Inter", sans-serif;
 }
@@ -158,7 +161,7 @@ window, .canvas-root {
     margin-right: 6px;
 }
 .notif-title {
-    color: #EEEEF0;
+    color: #F5F5F7;
     font-size: 11px;
     font-weight: 600;
     font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Inter", sans-serif;
@@ -189,7 +192,7 @@ window, .canvas-root {
     border-radius: 8px;
 }
 .full-title {
-    color: #EEEEF0;
+    color: #F5F5F7;
     font-size: 13.5px;
     font-weight: 600;
     font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Inter", sans-serif;
@@ -197,7 +200,7 @@ window, .canvas-root {
 }
 .full-artist {
     color: #A1A1A8;
-    font-size: 11px;
+    font-size: 11.5px;
     font-weight: 400;
     font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Inter", sans-serif;
 }
@@ -208,7 +211,7 @@ window, .canvas-root {
 }
 .full-lyric {
     color: #A1A1A8;
-    font-size: 11px;
+    font-size: 11.5px;
     font-weight: 400;
     font-style: italic;
     font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Inter", sans-serif;
@@ -228,13 +231,13 @@ scale {
     margin: 0;
 }
 scale trough {
-    background-color: #29292D;
+    background-color: #343438;
     border-radius: 2px;
     min-height: 3px;
     border: none;
 }
 scale slider {
-    background-color: #EEEEF0;
+    background-color: #D8D8DC;
     border-radius: 50%;
     min-width: 8px;
     min-height: 8px;
@@ -242,7 +245,7 @@ scale slider {
     box-shadow: 0 1px 3px rgba(0, 0, 0, 0.6);
 }
 .seek-slider highlight {
-    background-color: #EEEEF0;
+    background-color: #D8D8DC;
     border-radius: 2px;
     min-height: 3px;
     border: none;
@@ -266,6 +269,10 @@ button.ctrl-btn-play:disabled {
     padding: 0;
     color: #EEEEF0;
     -gtk-icon-shadow: none;
+}
+button.ctrl-btn:disabled,
+button.ctrl-btn-play:disabled {
+    color: #5B5B61;
 }
 button.ctrl-btn {
     min-width: 34px;
@@ -354,6 +361,7 @@ class AudioLevelMonitor:
         cmd = [
             pw_path,
             "--target", "@DEFAULT_AUDIO_SINK@",
+            "--latency", "32ms",
             "--rate", "8000",
             "--channels", "1",
             "--format", "s16",
@@ -482,7 +490,10 @@ class MediaActivityIndicator(Gtk.DrawingArea):
 
     def tick(self):
         if self._monitor:
-            self._bars = self._monitor.get_levels()
+            targets = self._monitor.get_levels()
+            for i in range(3):
+                # Smooth continuous interpolation between measurements
+                self._bars[i] = self._bars[i] * 0.65 + targets[i] * 0.35
             self.queue_draw()
 
     def _on_draw(self, widget, cr):
@@ -1026,6 +1037,158 @@ class LyricsController:
         return state
 
 # ─────────────────────────────────────────────────────────────
+#  CINEMA MODE CONTROLLER (Fullscreen Suppression)
+# ─────────────────────────────────────────────────────────────
+class CinemaModeController:
+    """Monitors whether another window is fullscreen on the current monitor.
+    Uses dual detection mechanisms:
+    1. GNOME Shell Cinema Bridge extension via session D-Bus (org.dynamicnotch.CinemaBridge)
+    2. Built-in low-latency XWayland/X11 detector querying _NET_ACTIVE_WINDOW & _NET_CLIENT_LIST
+    3. Manual override file (/tmp/dynamic_notch_cinema_override)
+    """
+    def __init__(self, on_change_callback=None):
+        self._on_change_callback = on_change_callback
+        self._is_fullscreen = False
+        self._bridge_available = False
+        self._dbus_fs = False
+        self._lock = threading.Lock()
+        self._display = None
+        self._root = None
+
+        # 1. Setup D-Bus listener for GNOME Shell Cinema Bridge
+        try:
+            self._bus = dbus.SessionBus()
+            self._bus.add_signal_receiver(
+                self._on_bridge_signal,
+                signal_name="FullscreenChanged",
+                dbus_interface="org.dynamicnotch.CinemaBridge"
+            )
+            # Check initial state if service is already present
+            if "org.dynamicnotch.CinemaBridge" in self._bus.list_names():
+                bridge = self._bus.get_object("org.dynamicnotch.CinemaBridge", "/org/dynamicnotch/CinemaBridge")
+                iface = dbus.Interface(bridge, "org.dynamicnotch.CinemaBridge")
+                self._dbus_fs = bool(iface.GetFullscreen())
+                self._bridge_available = True
+        except Exception:
+            self._bus = None
+
+        # 2. Setup X11/XWayland detector via libX11.so.6
+        self._init_x11()
+
+    def _init_x11(self):
+        try:
+            self._x11 = ctypes.cdll.LoadLibrary("libX11.so.6")
+            self._x11.XOpenDisplay.restype = ctypes.c_void_p
+            self._x11.XDefaultRootWindow.restype = ctypes.c_ulong
+            self._x11.XInternAtom.restype = ctypes.c_ulong
+            self._display = self._x11.XOpenDisplay(None)
+            if self._display:
+                self._root = self._x11.XDefaultRootWindow(self._display)
+                self._atom_active = self._x11.XInternAtom(self._display, b"_NET_ACTIVE_WINDOW", False)
+                self._atom_clients = self._x11.XInternAtom(self._display, b"_NET_CLIENT_LIST", False)
+                self._atom_state = self._x11.XInternAtom(self._display, b"_NET_WM_STATE", False)
+                self._atom_fs = self._x11.XInternAtom(self._display, b"_NET_WM_STATE_FULLSCREEN", False)
+                self._atom_window = self._x11.XInternAtom(self._display, b"WINDOW", False)
+                self._atom_atom = self._x11.XInternAtom(self._display, b"ATOM", False)
+            else:
+                self._root = None
+        except Exception:
+            self._display = None
+            self._root = None
+
+    def _on_bridge_signal(self, is_fs):
+        with self._lock:
+            self._bridge_available = True
+            self._dbus_fs = bool(is_fs)
+        if self._on_change_callback:
+            GLib.idle_add(self._on_change_callback)
+
+    def check_fullscreen(self) -> bool:
+        # Check manual file override first
+        if os.path.exists("/tmp/dynamic_notch_cinema_override"):
+            return True
+
+        # Check D-Bus bridge state
+        with self._lock:
+            if self._bridge_available and self._dbus_fs:
+                return True
+
+        # Check X11 / XWayland root properties
+        return self._check_x11_fullscreen()
+
+    def _check_x11_fullscreen(self) -> bool:
+        if not self._display or not self._root:
+            return False
+        try:
+            # 1. Check active focused window
+            act_win = self._x11_get_active_window()
+            if act_win and self._x11_is_fullscreen(act_win):
+                return True
+
+            # 2. Check client list
+            return self._x11_check_clients_fullscreen()
+        except Exception:
+            return False
+
+    def _x11_get_active_window(self):
+        actual_type, actual_format = ctypes.c_ulong(), ctypes.c_int()
+        nitems, bytes_after = ctypes.c_ulong(), ctypes.c_ulong()
+        prop = ctypes.POINTER(ctypes.c_ulong)()
+        status = self._x11.XGetWindowProperty(
+            self._display, self._root, self._atom_active, 0, 1, False, self._atom_window,
+            ctypes.byref(actual_type), ctypes.byref(actual_format),
+            ctypes.byref(nitems), ctypes.byref(bytes_after), ctypes.byref(prop)
+        )
+        if status == 0 and prop and nitems.value > 0:
+            win = prop[0]
+            self._x11.XFree(prop)
+            return win
+        return None
+
+    def _x11_is_fullscreen(self, win):
+        actual_type, actual_format = ctypes.c_ulong(), ctypes.c_int()
+        nitems, bytes_after = ctypes.c_ulong(), ctypes.c_ulong()
+        prop = ctypes.POINTER(ctypes.c_ulong)()
+        status = self._x11.XGetWindowProperty(
+            self._display, win, self._atom_state, 0, 64, False, self._atom_atom,
+            ctypes.byref(actual_type), ctypes.byref(actual_format),
+            ctypes.byref(nitems), ctypes.byref(bytes_after), ctypes.byref(prop)
+        )
+        if status == 0 and prop:
+            for i in range(nitems.value):
+                if prop[i] == self._atom_fs:
+                    self._x11.XFree(prop)
+                    return True
+            self._x11.XFree(prop)
+        return False
+
+    def _x11_check_clients_fullscreen(self):
+        actual_type, actual_format = ctypes.c_ulong(), ctypes.c_int()
+        nitems, bytes_after = ctypes.c_ulong(), ctypes.c_ulong()
+        prop = ctypes.POINTER(ctypes.c_ulong)()
+        status = self._x11.XGetWindowProperty(
+            self._display, self._root, self._atom_clients, 0, 1024, False, self._atom_window,
+            ctypes.byref(actual_type), ctypes.byref(actual_format),
+            ctypes.byref(nitems), ctypes.byref(bytes_after), ctypes.byref(prop)
+        )
+        if status == 0 and prop:
+            for i in range(nitems.value):
+                win = prop[i]
+                if self._x11_is_fullscreen(win):
+                    self._x11.XFree(prop)
+                    return True
+            self._x11.XFree(prop)
+        return False
+
+    def close(self):
+        if self._display:
+            try:
+                self._x11.XCloseDisplay(self._display)
+            except Exception:
+                pass
+            self._display = None
+
+# ─────────────────────────────────────────────────────────────
 #  MAIN DYNAMIC ISLAND WINDOW (FIXED CANVAS ARCHITECTURE)
 # ─────────────────────────────────────────────────────────────
 class DynamicIslandWindow(Gtk.Window):
@@ -1034,6 +1197,7 @@ class DynamicIslandWindow(Gtk.Window):
     STATE_FULL = 2
     STATE_NOTIF = 3
     STATE_EMPTY = 4
+    STATE_CINEMA_SUPPRESSED = 5
 
     def __init__(self):
         super().__init__(type=Gtk.WindowType.TOPLEVEL)
@@ -1078,6 +1242,11 @@ class DynamicIslandWindow(Gtk.Window):
         # Real PipeWire Audio-Reactive Equalizer Monitor
         self._audio_monitor = AudioLevelMonitor()
 
+        # Cinema Mode Controller (Fullscreen Suppression)
+        self._cinema = CinemaModeController(on_change_callback=self._on_cinema_state_changed)
+        self._is_cinema_suppressed = False
+        self._cinema_debounce_counter = 0
+
         self._setup_window()
         self._build_ui()
         self._apply_css()
@@ -1090,17 +1259,84 @@ class DynamicIslandWindow(Gtk.Window):
         self._idle_box.set_visible(True)
         self._update_input_shape(IDLE_W, IDLE_H)
 
+        # Check cinema mode immediately before starting timers and first tick
+        if self._cinema.check_fullscreen():
+            self._enter_cinema_suppression()
+        else:
+            self._on_tick()
+
         GLib.timeout_add(UPDATE_INTERVAL_MS, self._on_tick)
         GLib.timeout_add(LYRIC_TICK_MS, self._on_lyric_tick)
         GLib.timeout_add(ACTIVITY_TICK_MS, self._on_activity_tick)
-        self._on_tick()
+        GLib.timeout_add(CINEMA_POLL_MS, self._check_cinema_mode)
 
         # Start background water reminder
         self._start_water_reminder()
 
         self.connect("delete-event", self._on_delete)
 
+    def _on_cinema_state_changed(self):
+        GLib.idle_add(self._check_cinema_mode)
+
+    def _check_cinema_mode(self):
+        fs = self._cinema.check_fullscreen()
+        if fs:
+            self._cinema_debounce_counter = min(3, self._cinema_debounce_counter + 1)
+        else:
+            self._cinema_debounce_counter = max(0, self._cinema_debounce_counter - 1)
+
+        # Immediate enter when fullscreen detected
+        if fs and not self._is_cinema_suppressed:
+            self._enter_cinema_suppression()
+        # Debounced exit (ensure stable un-fullscreen for ~400ms before restoring)
+        elif not fs and self._is_cinema_suppressed and self._cinema_debounce_counter == 0:
+            self._exit_cinema_suppression()
+
+        return True
+
+    def _enter_cinema_suppression(self):
+        self._is_cinema_suppressed = True
+        self._state = self.STATE_CINEMA_SUPPRESSED
+        if self._anim_running:
+            self._anim_running = False
+        if self._collapse_timer:
+            GLib.source_remove(self._collapse_timer)
+            self._collapse_timer = None
+        if self._notif_timer:
+            GLib.source_remove(self._notif_timer)
+            self._notif_timer = None
+
+        # Hide all child boxes
+        self._full_box.set_visible(False)
+        self._compact_box.set_visible(False)
+        self._empty_box.set_visible(False)
+        self._idle_box.set_visible(False)
+        self._notif_box.set_visible(False)
+
+        # Clear input shape
+        self._update_input_shape(0, 0)
+
+        # Withdraw the GTK window completely from display
+        self.hide()
+
+    def _exit_cinema_suppression(self):
+        self._is_cinema_suppressed = False
+
+        # Refresh media info and lyrics first to ensure fresh data
+        self._last_info = self.media.get_info()
+        self._on_lyric_tick()
+
+        # Show window
+        self.show()
+
+        has_music = bool(self._last_info.get("title") and self._last_info.get("status") != "Stopped")
+        target = self.STATE_COMPACT if has_music else self.STATE_IDLE
+        self._state = self.STATE_IDLE
+        self._animate_to(target)
+
     def _on_activity_tick(self):
+        if self._is_cinema_suppressed or self._state == self.STATE_CINEMA_SUPPRESSED:
+            return True
         if self._state == self.STATE_COMPACT and hasattr(self, "compact_activity"):
             self.compact_activity.tick()
         elif self._state == self.STATE_FULL and hasattr(self, "full_activity"):
@@ -1108,6 +1344,8 @@ class DynamicIslandWindow(Gtk.Window):
         return True
 
     def _on_delete(self, *_):
+        if hasattr(self, "_cinema") and self._cinema:
+            self._cinema.close()
         if hasattr(self, "_audio_monitor") and self._audio_monitor:
             self._audio_monitor.stop()
         if self._water_reminder_timer:
@@ -1548,6 +1786,9 @@ class DynamicIslandWindow(Gtk.Window):
     #  TRANSIENT NOTIFICATIONS
     # ─────────────────────────────────────────────────────────
     def show_notification(self, icon: str, title: str, subtitle: str = "", duration_s: float = 1.2):
+        if self._is_cinema_suppressed or self._state == self.STATE_CINEMA_SUPPRESSED:
+            return  # Suppress all in-island notifications over fullscreen video!
+
         self._notif_icon.set_text(icon)
         self._notif_title.set_text(title)
         self._notif_sub.set_text(subtitle)
@@ -1573,6 +1814,10 @@ class DynamicIslandWindow(Gtk.Window):
     def _update_input_shape(self, w, h):
         gdk_win = self.get_window()
         if gdk_win:
+            if w <= 0 or h <= 0:
+                reg = cairo.Region()
+                gdk_win.input_shape_combine_region(reg, 0, 0)
+                return
             px = int((CANVAS_W - w) / 2)
             rect = cairo.RectangleInt(px, 0, int(w), int(h))
             reg = cairo.Region(rect)
@@ -1582,6 +1827,9 @@ class DynamicIslandWindow(Gtk.Window):
     #  60 FPS SMOOTH ANIMATION ENGINE (CUBIC EASE-OUT)
     # ─────────────────────────────────────────────────────────
     def _animate_to(self, target_state):
+        if self._is_cinema_suppressed:
+            return  # Never start animation while cinema-suppressed
+
         if self._state == target_state and not self._anim_running:
             if target_state != self.STATE_FULL:
                 return
@@ -1684,8 +1932,9 @@ class DynamicIslandWindow(Gtk.Window):
                 self.STATE_EMPTY: (EMPTY_EXPANDED_W, EMPTY_EXPANDED_H),
                 self.STATE_FULL: (EXPANDED_W, EXPANDED_H if self._has_lyrics else EXPANDED_H_NOLYRIC),
             }
-            w, h = dim_map[self._state]
-            self._update_input_shape(w, h)
+            if self._state in dim_map:
+                w, h = dim_map[self._state]
+                self._update_input_shape(w, h)
             return False
 
         return True
@@ -1694,6 +1943,8 @@ class DynamicIslandWindow(Gtk.Window):
     #  HOVER, MOTION & SCROLL HANDLERS
     # ─────────────────────────────────────────────────────────
     def _on_scroll(self, widget, event):
+        if self._is_cinema_suppressed or self._state == self.STATE_CINEMA_SUPPRESSED:
+            return False
         curr = self.vol.get()
         if event.direction == Gdk.ScrollDirection.UP:
             new_v = min(1.5, curr + 0.05)
@@ -1711,6 +1962,8 @@ class DynamicIslandWindow(Gtk.Window):
         return True
 
     def _on_enter(self, widget, event):
+        if self._is_cinema_suppressed or self._state == self.STATE_CINEMA_SUPPRESSED:
+            return False
         if event.detail == Gdk.NotifyType.INFERIOR:
             return False
         if self._collapse_timer:
@@ -1723,6 +1976,8 @@ class DynamicIslandWindow(Gtk.Window):
         return False
 
     def _on_motion(self, widget, event):
+        if self._is_cinema_suppressed or self._state == self.STATE_CINEMA_SUPPRESSED:
+            return False
         if self._collapse_timer:
             GLib.source_remove(self._collapse_timer)
             self._collapse_timer = None
@@ -1808,6 +2063,9 @@ class DynamicIslandWindow(Gtk.Window):
     #  PERIODIC TICK (SPOTIFY METADATA + BATTERY NOTIFICATIONS)
     # ─────────────────────────────────────────────────────────
     def _on_tick(self):
+        if self._is_cinema_suppressed or self._state == self.STATE_CINEMA_SUPPRESSED:
+            return True
+
         # Verify geometry & monitor workarea on each tick
         self._update_geometry_and_position()
 
@@ -1851,7 +2109,10 @@ class DynamicIslandWindow(Gtk.Window):
         dur_s = info.get("length_us", 0) // 1_000_000
         self.lyrics.update_track(info.get("title"), info.get("artist"), info.get("album"), dur_s)
 
-        # Auto-state transition when not hovered and not in notification
+        # Auto-state transition when not hovered, not in notification, and not cinema-suppressed
+        if self._is_cinema_suppressed or self._state == self.STATE_CINEMA_SUPPRESSED:
+            return True
+
         if not self._anim_running and self._state not in (self.STATE_FULL, self.STATE_EMPTY, self.STATE_NOTIF):
             if has_music and self._state == self.STATE_IDLE:
                 self._animate_to(self.STATE_COMPACT)
@@ -1963,10 +2224,22 @@ class DynamicIslandWindow(Gtk.Window):
 #  ENTRY POINT
 # ─────────────────────────────────────────────────────────────
 def main():
+    if "--cinema-toggle" in sys.argv:
+        override = "/tmp/dynamic_notch_cinema_override"
+        if os.path.exists(override):
+            os.remove(override)
+            print("🎬 Cinema Mode override toggled OFF (Dynamic Island restored).")
+        else:
+            with open(override, "w") as f:
+                f.write("1\n")
+            print("🎬 Cinema Mode override toggled ON (Dynamic Island suppressed).")
+        sys.exit(0)
+
     print("🚀 Dynamic Notch is running!")
     print("   📍 Position: Centered top notch on Wayland desktop (XWayland).")
     print("   💡 Hover over the notch to expand the music player.")
     print("   💧 Background water reminders every 30 minutes via notify-send.")
+    print("   🎬 Cinema Mode: Automatically hides over fullscreen video (VLC/Browser/etc).")
     print("   🛑 Press Ctrl+C to terminate.\n")
     win = DynamicIslandWindow()
     Gtk.main()
