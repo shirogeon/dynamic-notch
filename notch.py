@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026 Shiroge(Leon)
+# SPDX-License-Identifier: MIT
 """
 Custom Dynamic Island Desktop Companion for Linux
 Platform: Linux / Wayland (via XWayland backend)
@@ -331,6 +333,7 @@ class AudioLevelMonitor:
         self._levels = [0.25, 0.25, 0.25]
         self._is_playing = False
         self._running = True
+        self._proc = None
         self._source_name = "Initializing..."
         self._thread = threading.Thread(target=self._worker, daemon=True)
         self._thread.start()
@@ -349,6 +352,40 @@ class AudioLevelMonitor:
 
     def stop(self):
         self._running = False
+        with self._lock:
+            proc = self._proc
+            self._proc = None
+        if proc:
+            try:
+                proc.terminate()
+                proc.wait(timeout=0.2)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+            try:
+                if proc.stdout:
+                    proc.stdout.close()
+            except Exception:
+                pass
+
+    @staticmethod
+    def compute_goertzel(samples, target_freq: float, sample_rate: float = 8000.0) -> float:
+        """Goertzel algorithm to compute single-frequency DFT power with O(N) complexity."""
+        N = len(samples)
+        if N == 0:
+            return 0.0
+        k = int(0.5 + (N * target_freq) / sample_rate)
+        omega = (2.0 * math.pi * k) / N
+        coeff = 2.0 * math.cos(omega)
+        s_prev = 0.0
+        s_prev2 = 0.0
+        for x in samples:
+            s = x + coeff * s_prev - s_prev2
+            s_prev2 = s_prev
+            s_prev = s
+        return max(0.0, s_prev2 * s_prev2 + s_prev * s_prev - coeff * s_prev * s_prev2)
 
     def _worker(self):
         pw_path = shutil.which("pw-record")
@@ -376,6 +413,7 @@ class AudioLevelMonitor:
                 bufsize=1024
             )
             with self._lock:
+                self._proc = proc
                 self._source_name = "PipeWire monitor stream (@DEFAULT_AUDIO_SINK@)"
         except Exception as e:
             with self._lock:
@@ -383,66 +421,69 @@ class AudioLevelMonitor:
             self._fallback_loop()
             return
 
-        def goertzel(samples, target_freq, sample_rate=8000):
-            N = len(samples)
-            k = int(0.5 + (N * target_freq) / sample_rate)
-            omega = (2.0 * math.pi * k) / N
-            coeff = 2.0 * math.cos(omega)
-            s_prev = 0.0
-            s_prev2 = 0.0
-            for x in samples:
-                s = x + coeff * s_prev - s_prev2
-                s_prev2 = s_prev
-                s_prev = s
-            return max(0.0, s_prev2 * s_prev2 + s_prev * s_prev - coeff * s_prev * s_prev2)
-
         peaks = [1e6, 1e6, 1e6]
         cur_levels = [0.25, 0.25, 0.25]
         chunk_bytes = 512  # 256 samples of 16-bit PCM = 32ms
 
-        while self._running:
-            try:
-                raw = proc.stdout.read(chunk_bytes)
-                if not raw or len(raw) < chunk_bytes:
-                    time.sleep(0.02)
-                    continue
-
-                samples = struct.unpack("<256h", raw)
-                rms = math.sqrt(sum(s * s for s in samples) / 256.0)
-
-                with self._lock:
-                    is_play = self._is_playing
-
-                if not is_play or rms < 45.0:
-                    # Settle to static resting bars
-                    for j in range(3):
-                        cur_levels[j] = cur_levels[j] * 0.88 + 0.25 * 0.12
-                else:
-                    powers = [
-                        goertzel(samples, 160),   # Bass (~160 Hz)
-                        goertzel(samples, 800),   # Mid (~800 Hz)
-                        goertzel(samples, 2400)   # Treble (~2400 Hz)
-                    ]
-                    for j in range(3):
-                        peaks[j] = max(powers[j], peaks[j] * 0.992)
-                        raw_norm = math.sqrt(powers[j] / max(peaks[j], 1.0))
-                        target = 0.15 + 0.85 * min(1.0, max(0.0, raw_norm ** 0.72))
-                        # Attack / decay filter
-                        if target > cur_levels[j]:
-                            cur_levels[j] = cur_levels[j] * 0.35 + target * 0.65
-                        else:
-                            cur_levels[j] = cur_levels[j] * 0.84 + target * 0.16
-
-                with self._lock:
-                    self._levels = list(cur_levels)
-
-            except Exception:
-                time.sleep(0.05)
-
         try:
-            proc.terminate()
-        except Exception:
-            pass
+            while self._running:
+                try:
+                    raw = proc.stdout.read(chunk_bytes)
+                    if not raw or len(raw) < chunk_bytes:
+                        if proc.poll() is not None:
+                            break  # Subprocess exited or audio sink disconnected
+                        time.sleep(0.02)
+                        continue
+
+                    samples = struct.unpack("<256h", raw)
+                    rms = math.sqrt(sum(s * s for s in samples) / 256.0)
+
+                    with self._lock:
+                        is_play = self._is_playing
+
+                    if not is_play or rms < 45.0:
+                        for j in range(3):
+                            cur_levels[j] = cur_levels[j] * 0.88 + 0.25 * 0.12
+                    else:
+                        powers = [
+                            self.compute_goertzel(samples, 160),   # Bass (~160 Hz)
+                            self.compute_goertzel(samples, 800),   # Mid (~800 Hz)
+                            self.compute_goertzel(samples, 2400)  # Treble (~2400 Hz)
+                        ]
+                        for j in range(3):
+                            peaks[j] = max(powers[j], peaks[j] * 0.992)
+                            raw_norm = math.sqrt(powers[j] / max(peaks[j], 1.0))
+                            target = 0.15 + 0.85 * min(1.0, max(0.0, raw_norm ** 0.72))
+                            if target > cur_levels[j]:
+                                cur_levels[j] = cur_levels[j] * 0.35 + target * 0.65
+                            else:
+                                cur_levels[j] = cur_levels[j] * 0.84 + target * 0.16
+
+                    with self._lock:
+                        self._levels = list(cur_levels)
+
+                except Exception:
+                    time.sleep(0.05)
+        finally:
+            with self._lock:
+                p = self._proc
+                self._proc = None
+            if p:
+                try:
+                    p.terminate()
+                    p.wait(timeout=0.2)
+                except Exception:
+                    pass
+                try:
+                    if p.stdout:
+                        p.stdout.close()
+                except Exception:
+                    pass
+
+        if self._running:
+            with self._lock:
+                self._source_name = "Pseudo-reactive fallback (audio stream disconnected)"
+            self._fallback_loop()
 
     def _fallback_loop(self):
         cur_levels = [0.25, 0.25, 0.25]
@@ -491,10 +532,14 @@ class MediaActivityIndicator(Gtk.DrawingArea):
     def tick(self):
         if self._monitor:
             targets = self._monitor.get_levels()
+            changed = False
             for i in range(3):
-                # Smooth continuous interpolation between measurements
-                self._bars[i] = self._bars[i] * 0.65 + targets[i] * 0.35
-            self.queue_draw()
+                new_bar = self._bars[i] * 0.65 + targets[i] * 0.35
+                if abs(new_bar - self._bars[i]) > 0.001:
+                    changed = True
+                self._bars[i] = new_bar
+            if changed:
+                self.queue_draw()
 
     def _on_draw(self, widget, cr):
         w = widget.get_allocated_width()
@@ -558,6 +603,9 @@ class MediaController:
                 self._player = None
                 self._props = None
                 self._name = None
+                self._cached_art_url = None
+                self._cached_pixbuf_expanded = None
+                self._cached_pixbuf_compact = None
                 self._scan()
             if self._on_change_callback:
                 GLib.idle_add(self._on_change_callback)
@@ -608,10 +656,13 @@ class MediaController:
             "status": "Stopped",
             "track_id": "/",
             "art_url": None,
-            "pixbuf": self._cached_pixbuf_expanded,
-            "pixbuf_compact": self._cached_pixbuf_compact,
+            "pixbuf": None,
+            "pixbuf_compact": None,
         }
         if not self.is_available():
+            self._cached_art_url = None
+            self._cached_pixbuf_expanded = None
+            self._cached_pixbuf_compact = None
             return default
         try:
             p = self._props.GetAll("org.mpris.MediaPlayer2.Player")
@@ -626,9 +677,14 @@ class MediaController:
             track_id = str(meta.get("mpris:trackid", "/"))
             art_url = str(meta.get("mpris:artUrl", "")) or None
 
-            if art_url and art_url != self._cached_art_url:
-                self._cached_art_url = art_url
-                threading.Thread(target=self._fetch_art, args=(art_url,), daemon=True).start()
+            if art_url:
+                if art_url != self._cached_art_url:
+                    self._cached_art_url = art_url
+                    threading.Thread(target=self._fetch_art, args=(art_url,), daemon=True).start()
+            else:
+                self._cached_art_url = None
+                self._cached_pixbuf_expanded = None
+                self._cached_pixbuf_compact = None
 
             return {
                 "title": title,
@@ -645,6 +701,10 @@ class MediaController:
         except Exception:
             self._player = None
             self._props = None
+            self._name = None
+            self._cached_art_url = None
+            self._cached_pixbuf_expanded = None
+            self._cached_pixbuf_compact = None
             return default
 
     def _fetch_art(self, url):
@@ -652,12 +712,18 @@ class MediaController:
         try:
             urllib.request.urlretrieve(url, cache_file)
             pb_exp = GdkPixbuf.Pixbuf.new_from_file_at_scale(cache_file, ART_SIZE_EXPANDED, ART_SIZE_EXPANDED, True)
-            self._cached_pixbuf_expanded = round_corners_pixbuf(pb_exp, radius=8)
+            exp = round_corners_pixbuf(pb_exp, radius=8)
             pb_comp = GdkPixbuf.Pixbuf.new_from_file_at_scale(cache_file, ART_SIZE_COMPACT, ART_SIZE_COMPACT, True)
-            self._cached_pixbuf_compact = round_corners_pixbuf(pb_comp, radius=6)
+            comp = round_corners_pixbuf(pb_comp, radius=6)
+            if self._cached_art_url == url:
+                self._cached_pixbuf_expanded = exp
+                self._cached_pixbuf_compact = comp
+                if self._on_change_callback:
+                    GLib.idle_add(self._on_change_callback)
         except Exception:
-            self._cached_pixbuf_expanded = None
-            self._cached_pixbuf_compact = None
+            if self._cached_art_url == url:
+                self._cached_pixbuf_expanded = None
+                self._cached_pixbuf_compact = None
 
     def play_pause(self):
         if self.is_available():
@@ -735,27 +801,40 @@ class VolumeController:
 class BluetoothBattery:
     _AUDIO_ICONS = {"audio-headphones", "audio-headset", "audio-card"}
 
+    def __init__(self):
+        self._bus = None
+        try:
+            self._bus = dbus.SystemBus()
+        except Exception:
+            self._bus = None
+
     def get_info(self):
         # 1. Bluetooth Headphones / TWS check
-        try:
-            bus = dbus.SystemBus()
-            mgr = dbus.Interface(
-                bus.get_object("org.bluez", "/"),
-                "org.freedesktop.DBus.ObjectManager"
-            )
-            for path, ifaces in mgr.GetManagedObjects().items():
-                if "org.bluez.Battery1" in ifaces:
-                    pct = int(ifaces["org.bluez.Battery1"].get("Percentage", 0))
-                    dev = ifaces.get("org.bluez.Device1", {})
-                    name = str(dev.get("Name", "TWS"))[:12] if dev else "TWS"
-                    return {"name": name, "percent": pct, "is_laptop": False, "charging": False}
-                if "org.bluez.Device1" in ifaces:
-                    dev = ifaces["org.bluez.Device1"]
-                    if dev.get("Connected") and str(dev.get("Icon", "")) in self._AUDIO_ICONS:
-                        name = str(dev.get("Name", "TWS"))[:12]
-                        return {"name": name, "percent": -1, "is_laptop": False, "charging": False}
-        except Exception:
-            pass
+        if self._bus is None:
+            try:
+                self._bus = dbus.SystemBus()
+            except Exception:
+                self._bus = None
+
+        if self._bus is not None:
+            try:
+                mgr = dbus.Interface(
+                    self._bus.get_object("org.bluez", "/"),
+                    "org.freedesktop.DBus.ObjectManager"
+                )
+                for path, ifaces in mgr.GetManagedObjects().items():
+                    if "org.bluez.Battery1" in ifaces:
+                        pct = int(ifaces["org.bluez.Battery1"].get("Percentage", 0))
+                        dev = ifaces.get("org.bluez.Device1", {})
+                        name = str(dev.get("Name", "TWS"))[:12] if dev else "TWS"
+                        return {"name": name, "percent": pct, "is_laptop": False, "charging": False}
+                    if "org.bluez.Device1" in ifaces:
+                        dev = ifaces["org.bluez.Device1"]
+                        if dev.get("Connected") and str(dev.get("Icon", "")) in self._AUDIO_ICONS:
+                            name = str(dev.get("Name", "TWS"))[:12]
+                            return {"name": name, "percent": -1, "is_laptop": False, "charging": False}
+            except Exception:
+                pass
 
         # 2. Laptop Battery fallback
         try:
@@ -1221,6 +1300,11 @@ class DynamicIslandWindow(Gtk.Window):
         self._anim_start_time = 0.0
         self._anim_running = False
 
+        self._tick_timer = None
+        self._lyric_timer = None
+        self._activity_timer = None
+        self._cinema_timer = None
+        self._anim_timer = None
         self._collapse_timer = None
         self._notif_timer = None
         self._water_reminder_timer = None
@@ -1259,21 +1343,30 @@ class DynamicIslandWindow(Gtk.Window):
         self._idle_box.set_visible(True)
         self._update_input_shape(IDLE_W, IDLE_H)
 
-        # Check cinema mode immediately before starting timers and first tick
         if self._cinema.check_fullscreen():
             self._enter_cinema_suppression()
         else:
             self._on_tick()
 
-        GLib.timeout_add(UPDATE_INTERVAL_MS, self._on_tick)
-        GLib.timeout_add(LYRIC_TICK_MS, self._on_lyric_tick)
-        GLib.timeout_add(ACTIVITY_TICK_MS, self._on_activity_tick)
-        GLib.timeout_add(CINEMA_POLL_MS, self._check_cinema_mode)
+        self._tick_timer = GLib.timeout_add(UPDATE_INTERVAL_MS, self._on_tick)
+        self._lyric_timer = GLib.timeout_add(LYRIC_TICK_MS, self._on_lyric_tick)
+        self._activity_timer = GLib.timeout_add(ACTIVITY_TICK_MS, self._on_activity_tick)
+        self._cinema_timer = GLib.timeout_add(CINEMA_POLL_MS, self._check_cinema_mode)
 
-        # Start background water reminder
         self._start_water_reminder()
 
         self.connect("delete-event", self._on_delete)
+
+    def _cancel_timer(self, attr_name: str):
+        if attr_name == "_anim_timer":
+            self._anim_running = False
+        timer_id = getattr(self, attr_name, None)
+        if timer_id is not None:
+            try:
+                GLib.source_remove(timer_id)
+            except Exception:
+                pass
+            setattr(self, attr_name, None)
 
     def _on_cinema_state_changed(self):
         GLib.idle_add(self._check_cinema_mode)
@@ -1285,10 +1378,8 @@ class DynamicIslandWindow(Gtk.Window):
         else:
             self._cinema_debounce_counter = max(0, self._cinema_debounce_counter - 1)
 
-        # Immediate enter when fullscreen detected
         if fs and not self._is_cinema_suppressed:
             self._enter_cinema_suppression()
-        # Debounced exit (ensure stable un-fullscreen for ~400ms before restoring)
         elif not fs and self._is_cinema_suppressed and self._cinema_debounce_counter == 0:
             self._exit_cinema_suppression()
 
@@ -1299,40 +1390,43 @@ class DynamicIslandWindow(Gtk.Window):
         self._state = self.STATE_CINEMA_SUPPRESSED
         if self._anim_running:
             self._anim_running = False
-        if self._collapse_timer:
-            GLib.source_remove(self._collapse_timer)
-            self._collapse_timer = None
-        if self._notif_timer:
-            GLib.source_remove(self._notif_timer)
-            self._notif_timer = None
+        self._cancel_timer("_anim_timer")
+        self._cancel_timer("_collapse_timer")
+        self._cancel_timer("_notif_timer")
 
-        # Hide all child boxes
         self._full_box.set_visible(False)
         self._compact_box.set_visible(False)
         self._empty_box.set_visible(False)
         self._idle_box.set_visible(False)
         self._notif_box.set_visible(False)
 
-        # Clear input shape
         self._update_input_shape(0, 0)
-
-        # Withdraw the GTK window completely from display
         self.hide()
 
     def _exit_cinema_suppression(self):
         self._is_cinema_suppressed = False
 
-        # Refresh media info and lyrics first to ensure fresh data
         self._last_info = self.media.get_info()
         self._on_lyric_tick()
 
-        # Show window
         self.show()
 
         has_music = bool(self._last_info.get("title") and self._last_info.get("status") != "Stopped")
         target = self.STATE_COMPACT if has_music else self.STATE_IDLE
+
+        self._start_w = float(IDLE_W)
+        self._start_h = float(IDLE_H)
+        self._current_w = float(IDLE_W)
+        self._current_h = float(IDLE_H)
+        self._idle_box.set_visible(True)
+        self._idle_box.set_opacity(1.0)
+        self._update_input_shape(IDLE_W, IDLE_H)
+        self.queue_draw()
+
         self._state = self.STATE_IDLE
-        self._animate_to(target)
+        self._target_state = self.STATE_IDLE
+        if target != self.STATE_IDLE:
+            self._animate_to(target)
 
     def _on_activity_tick(self):
         if self._is_cinema_suppressed or self._state == self.STATE_CINEMA_SUPPRESSED:
@@ -1344,13 +1438,18 @@ class DynamicIslandWindow(Gtk.Window):
         return True
 
     def _on_delete(self, *_):
+        self._cancel_timer("_tick_timer")
+        self._cancel_timer("_lyric_timer")
+        self._cancel_timer("_activity_timer")
+        self._cancel_timer("_cinema_timer")
+        self._cancel_timer("_anim_timer")
+        self._cancel_timer("_collapse_timer")
+        self._cancel_timer("_notif_timer")
+        self._cancel_timer("_water_reminder_timer")
         if hasattr(self, "_cinema") and self._cinema:
             self._cinema.close()
         if hasattr(self, "_audio_monitor") and self._audio_monitor:
             self._audio_monitor.stop()
-        if self._water_reminder_timer:
-            GLib.source_remove(self._water_reminder_timer)
-            self._water_reminder_timer = None
         Gtk.main_quit()
         return False
 
@@ -1374,10 +1473,7 @@ class DynamicIslandWindow(Gtk.Window):
             )
         except Exception:
             pass
-        # Reschedule for next interval (return False to cancel current, re-add manually)
-        interval_ms = WATER_REMINDER_INTERVAL_MIN * 60 * 1000
-        self._water_reminder_timer = GLib.timeout_add(interval_ms, self._water_reminder_tick)
-        return False  # Cancel the current GLib source; we re-added above
+        return True
 
     def _setup_window(self):
         self.set_decorated(False)
@@ -1787,7 +1883,7 @@ class DynamicIslandWindow(Gtk.Window):
     # ─────────────────────────────────────────────────────────
     def show_notification(self, icon: str, title: str, subtitle: str = "", duration_s: float = 1.2):
         if self._is_cinema_suppressed or self._state == self.STATE_CINEMA_SUPPRESSED:
-            return  # Suppress all in-island notifications over fullscreen video!
+            return  # Suppress all in-island notifications over fullscreen video
 
         self._notif_icon.set_text(icon)
         self._notif_title.set_text(title)
@@ -1796,14 +1892,14 @@ class DynamicIslandWindow(Gtk.Window):
         if self._state == self.STATE_FULL:
             return  # Don't hijack expanded panel
 
-        if self._notif_timer:
-            GLib.source_remove(self._notif_timer)
-
+        self._cancel_timer("_notif_timer")
         self._animate_to(self.STATE_NOTIF)
         self._notif_timer = GLib.timeout_add(int(duration_s * 1000), self._dismiss_notification)
 
     def _dismiss_notification(self):
         self._notif_timer = None
+        if self._is_cinema_suppressed or self._state == self.STATE_CINEMA_SUPPRESSED:
+            return False
         has_music = bool(self._last_info.get("title") and self._last_info.get("status") != "Stopped")
         self._animate_to(self.STATE_COMPACT if has_music else self.STATE_IDLE)
         return False
@@ -1830,6 +1926,9 @@ class DynamicIslandWindow(Gtk.Window):
         if self._is_cinema_suppressed:
             return  # Never start animation while cinema-suppressed
 
+        if self._target_state == target_state and self._anim_running:
+            return  # Transition already actively in progress toward this target
+
         if self._state == target_state and not self._anim_running:
             if target_state != self.STATE_FULL:
                 return
@@ -1853,13 +1952,12 @@ class DynamicIslandWindow(Gtk.Window):
             target_w = float(EXPANDED_W)
             self._update_full_ui()
 
-        self._start_w = self._current_w
-        self._start_h = self._current_h
+        self._start_w = float(self._current_w)
+        self._start_h = float(self._current_h)
         self._anim_target_w = target_w
         self._anim_target_h = target_h
-        self._anim_start_time = time.time() * 1000.0
+        self._anim_start_time = 0.0  # Latch on first tick so pre-timer work does not consume animation budget
 
-        # Pre-activate target widget for seamless cross-fade
         active_boxes = {
             self.STATE_IDLE: self._idle_box,
             self.STATE_COMPACT: self._compact_box,
@@ -1867,8 +1965,16 @@ class DynamicIslandWindow(Gtk.Window):
             self.STATE_EMPTY: self._empty_box,
             self.STATE_FULL: self._full_box,
         }
+
+        # Snapshot start opacities for continuous cross-fading (even on mid-flight reversal)
+        self._start_opacities = {box: box.get_opacity() for box in active_boxes.values()}
+
         target_box = active_boxes.get(target_state)
         if target_box:
+            # If changing to a different state, incoming box must not pop in before ease-out
+            if self._state != target_state and not target_box.get_visible():
+                target_box.set_opacity(0.0)
+                self._start_opacities[target_box] = 0.0
             target_box.set_visible(True)
 
         if target_state == self.STATE_FULL:
@@ -1876,22 +1982,29 @@ class DynamicIslandWindow(Gtk.Window):
         elif target_state == self.STATE_EMPTY:
             self._update_input_shape(EMPTY_EXPANDED_W, EMPTY_EXPANDED_H)
 
-        if not self._anim_running:
-            self._anim_running = True
-            GLib.timeout_add(ANIM_INTERVAL_MS, self._anim_step)
+        self._cancel_timer("_anim_timer")
+        self._anim_running = True
+        self._anim_timer = GLib.timeout_add(ANIM_INTERVAL_MS, self._anim_step)
 
     def _anim_step(self):
-        now = time.time() * 1000.0
-        elapsed = now - self._anim_start_time
-        progress = min(1.0, elapsed / float(ANIM_DURATION_MS))
+        if not self._anim_running:
+            return False
 
-        # Smooth cubic ease-out deceleration curve
-        factor = 1.0 - (1.0 - progress) ** 3
+        now = time.time() * 1000.0
+        if self._anim_start_time <= 0.0:
+            self._anim_start_time = now
+            elapsed = 0.0
+            progress = 0.0
+            factor = 0.0
+        else:
+            elapsed = now - self._anim_start_time
+            progress = min(1.0, elapsed / float(ANIM_DURATION_MS))
+            # Smooth cubic ease-out deceleration curve
+            factor = 1.0 - (1.0 - progress) ** 3
 
         self._current_w = self._start_w + (self._anim_target_w - self._start_w) * factor
         self._current_h = self._start_h + (self._anim_target_h - self._start_h) * factor
 
-        # Cross-fade box opacities
         active_boxes = {
             self.STATE_IDLE: self._idle_box,
             self.STATE_COMPACT: self._compact_box,
@@ -1901,19 +2014,27 @@ class DynamicIslandWindow(Gtk.Window):
         }
 
         target_box = active_boxes.get(self._target_state)
-        in_op = max(0.0, min(1.0, (progress - 0.15) / 0.85))
-        out_op = max(0.0, 1.0 - progress * 2.2)
+        start_opacities = getattr(self, "_start_opacities", {})
 
         for s, box in active_boxes.items():
             if box == target_box:
-                box.set_opacity(in_op)
+                if self._state == self._target_state and self._state == self.STATE_FULL:
+                    # In-place height adjustment (e.g. lyrics arrival/departure)
+                    box.set_opacity(1.0)
+                else:
+                    target_start_op = start_opacities.get(box, 0.0)
+                    in_factor = max(0.0, min(1.0, (progress - 0.15) / 0.85))
+                    box.set_opacity(target_start_op + (1.0 - target_start_op) * in_factor)
             else:
-                box.set_opacity(out_op)
+                out_start_op = start_opacities.get(box, 1.0)
+                out_factor = max(0.0, 1.0 - progress * 2.2)
+                box.set_opacity(out_start_op * out_factor)
 
         self.queue_draw()
 
         if progress >= 1.0:
             self._anim_running = False
+            self._anim_timer = None
             self._state = self._target_state
             self._current_w = self._anim_target_w
             self._current_h = self._anim_target_h
@@ -1924,6 +2045,7 @@ class DynamicIslandWindow(Gtk.Window):
                     box.set_opacity(1.0)
                 else:
                     box.set_visible(False)
+                    box.set_opacity(0.0)
 
             dim_map = {
                 self.STATE_IDLE: (IDLE_W, IDLE_H),
@@ -1966,49 +2088,48 @@ class DynamicIslandWindow(Gtk.Window):
             return False
         if event.detail == Gdk.NotifyType.INFERIOR:
             return False
-        if self._collapse_timer:
-            GLib.source_remove(self._collapse_timer)
-            self._collapse_timer = None
+        self._cancel_timer("_collapse_timer")
         has_music = bool(self._last_info.get("title") and self._last_info.get("status") != "Stopped")
         target = self.STATE_FULL if has_music else self.STATE_EMPTY
-        if self._state != target:
+        if self._target_state != target or (self._state != target and not self._anim_running):
             self._animate_to(target)
         return False
 
     def _on_motion(self, widget, event):
         if self._is_cinema_suppressed or self._state == self.STATE_CINEMA_SUPPRESSED:
             return False
-        if self._collapse_timer:
-            GLib.source_remove(self._collapse_timer)
-            self._collapse_timer = None
+        self._cancel_timer("_collapse_timer")
         has_music = bool(self._last_info.get("title") and self._last_info.get("status") != "Stopped")
         target = self.STATE_FULL if has_music else self.STATE_EMPTY
-        if self._state != target and not self._anim_running:
+        if self._target_state != target or (self._state != target and not self._anim_running):
             self._animate_to(target)
         return False
 
     def _on_leave(self, widget, event):
         if event.detail == Gdk.NotifyType.INFERIOR:
             return False
-        if self._seeking:
+        if self._seeking or self._is_cinema_suppressed or self._state == self.STATE_CINEMA_SUPPRESSED:
             return False
-        if self._collapse_timer:
-            GLib.source_remove(self._collapse_timer)
+        self._cancel_timer("_collapse_timer")
         self._collapse_timer = GLib.timeout_add(COLLAPSE_DELAY_MS, self._do_collapse)
         return False
 
     def _do_collapse(self):
         self._collapse_timer = None
-        if self._seeking:
+        if self._seeking or self._is_cinema_suppressed or self._state == self.STATE_CINEMA_SUPPRESSED:
             return False
         has_music = bool(self._last_info.get("title") and self._last_info.get("status") != "Stopped")
-        self._animate_to(self.STATE_COMPACT if has_music else self.STATE_IDLE)
+        target = self.STATE_COMPACT if has_music else self.STATE_IDLE
+        if self._target_state != target or (self._state != target and not self._anim_running):
+            self._animate_to(target)
         return False
 
     # ─────────────────────────────────────────────────────────
     #  REAL-TIME SYNCED LYRIC POLLING (150ms)
     # ─────────────────────────────────────────────────────────
     def _on_lyric_tick(self):
+        if self._is_cinema_suppressed or self._state == self.STATE_CINEMA_SUPPRESSED:
+            return True
         if not self._last_info:
             return True
 
@@ -2036,9 +2157,7 @@ class DynamicIslandWindow(Gtk.Window):
             self._has_lyrics = should_show
             self._lyric_row.set_visible(should_show)
             if self._state == self.STATE_FULL and not self._anim_running:
-                target_h = float(EXPANDED_H if self._has_lyrics else EXPANDED_H_NOLYRIC)
-                self._current_h = target_h
-                self._update_input_shape(EXPANDED_W, target_h)
+                self._animate_to(self.STATE_FULL)
                 self.queue_draw()
 
         if has_synced:
@@ -2063,15 +2182,36 @@ class DynamicIslandWindow(Gtk.Window):
     #  PERIODIC TICK (SPOTIFY METADATA + BATTERY NOTIFICATIONS)
     # ─────────────────────────────────────────────────────────
     def _on_tick(self):
+        info = self.media.get_info()
+        tws = self.bt.get_info()
+        self._last_info = info
+
+        # Continuous background media & audio tracking
+        has_music = bool(info.get("title") and info.get("status") != "Stopped")
+        is_playing = (info.get("status") == "Playing")
+        if hasattr(self, "_audio_monitor") and self._audio_monitor:
+            self._audio_monitor.set_playing(is_playing)
+
+        title = info.get("title")
+        artist = info.get("artist") or ""
+        track_id = info.get("track_id") or "/"
+        current_track_key = f"{track_id}|{artist}|{title}" if has_music else None
+
+        if current_track_key != self._current_track_key:
+            self._current_track_key = current_track_key
+            self._last_lyric_line = ""
+            if hasattr(self, "_full_lyric_label"):
+                self._full_lyric_label.set_text("")
+
+        dur_s = info.get("length_us", 0) // 1_000_000
+        self.lyrics.update_track(info.get("title"), info.get("artist"), info.get("album"), dur_s)
+
+        # In Cinema Mode, keep window hidden and suppress on-screen notifications/draws
         if self._is_cinema_suppressed or self._state == self.STATE_CINEMA_SUPPRESSED:
             return True
 
         # Verify geometry & monitor workarea on each tick
         self._update_geometry_and_position()
-
-        info = self.media.get_info()
-        tws = self.bt.get_info()
-        self._last_info = info
 
         # Battery power state transitions & low battery notifications
         if tws and tws.get("is_laptop"):
@@ -2089,30 +2229,7 @@ class DynamicIslandWindow(Gtk.Window):
                 self._low_battery_notified = False
             self._last_battery_state = curr_charging
 
-        has_music = bool(info.get("title") and info.get("status") != "Stopped")
-        is_playing = (info.get("status") == "Playing")
-        if hasattr(self, "_audio_monitor") and self._audio_monitor:
-            self._audio_monitor.set_playing(is_playing)
-
-        # Track identity tracking to immediately clear stale lyrics on song change
-        title = info.get("title")
-        artist = info.get("artist") or ""
-        track_id = info.get("track_id") or "/"
-        current_track_key = f"{track_id}|{artist}|{title}" if has_music else None
-
-        if current_track_key != self._current_track_key:
-            self._current_track_key = current_track_key
-            self._last_lyric_line = ""
-            self._full_lyric_label.set_text("")
-
-        # Update lyrics controller track with duration for exact match
-        dur_s = info.get("length_us", 0) // 1_000_000
-        self.lyrics.update_track(info.get("title"), info.get("artist"), info.get("album"), dur_s)
-
         # Auto-state transition when not hovered, not in notification, and not cinema-suppressed
-        if self._is_cinema_suppressed or self._state == self.STATE_CINEMA_SUPPRESSED:
-            return True
-
         if not self._anim_running and self._state not in (self.STATE_FULL, self.STATE_EMPTY, self.STATE_NOTIF):
             if has_music and self._state == self.STATE_IDLE:
                 self._animate_to(self.STATE_COMPACT)
@@ -2238,7 +2355,7 @@ def main():
     print("🚀 Dynamic Notch is running!")
     print("   📍 Position: Centered top notch on Wayland desktop (XWayland).")
     print("   💡 Hover over the notch to expand the music player.")
-    print("   💧 Background water reminders every 30 minutes via notify-send.")
+    print(f"   💧 Background water reminders every {WATER_REMINDER_INTERVAL_MIN} minutes via notify-send.")
     print("   🎬 Cinema Mode: Automatically hides over fullscreen video (VLC/Browser/etc).")
     print("   🛑 Press Ctrl+C to terminate.\n")
     win = DynamicIslandWindow()
