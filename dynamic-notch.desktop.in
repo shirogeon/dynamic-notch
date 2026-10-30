@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Dynamic Notch
+Comment=Dynamic Island desktop companion for Linux
+Exec=@EXEC_PATH@
+Icon=multimedia-player
+Terminal=false
+Categories=Utility;Audio;
+StartupNotify=false
+X-GNOME-Autostart-enabled=true

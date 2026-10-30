@@ -1,9 +1,0 @@
-[Desktop Entry]
-Type=Application
-Name=Dynamic Notch
-Comment=Dynamic Island-like overlay for Linux laptops
-Exec=/home/leong/Documents/code/notch-test/run.sh
-Icon=multimedia-player
-Terminal=false
-Categories=Utility;
-X-GNOME-Autostart-enabled=true

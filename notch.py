@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Copyright (c) 2026 Shiroge(Leon)
+# Copyright (c) 2026 Shiroge (Leon)
 # SPDX-License-Identifier: MIT
 """
 Custom Dynamic Island Desktop Companion for Linux
@@ -27,6 +27,8 @@ from ctypes import c_int, c_ulong, POINTER, byref
 import json
 import re
 import glob
+import fcntl
+import tempfile
 import urllib.request
 import urllib.parse
 import threading
@@ -58,7 +60,7 @@ COMPACT_W = 280             # Compact playing/paused capsule (270-300 px target)
 COMPACT_H = 44              # (44-48 px target)
 
 EXPANDED_W = 400            # Expanded music player (390-420 px target)
-EXPANDED_H = 168            # (155-180 px target, with lyric line)
+EXPANDED_H = 178            # (155-185 px target, with 2-line lyric area)
 EXPANDED_H_NOLYRIC = 146    # (145-175 px target, without lyric line)
 
 EMPTY_EXPANDED_W = 240      # When expanded with no media playing
@@ -70,8 +72,10 @@ NOTIF_H = 40
 MARGIN_TOP_SCREEN = 0       # Flush with screen top when top panel is hidden
 MARGIN_TOP_PANEL = 0        # Flush with bottom edge of top panel when present
 
-ANIM_DURATION_MS = 200      # 200ms smooth ease-out (160-230 ms target)
-ANIM_INTERVAL_MS = 16       # 60 FPS tick
+ANIM_EXPAND_MS = 300        # 300ms organic fluid expansion (280-320 ms target)
+ANIM_COLLAPSE_MS = 250      # 250ms responsive cushioned collapse (230-270 ms target)
+ANIM_DURATION_MS = ANIM_EXPAND_MS  # Backward-compatible duration alias
+ANIM_INTERVAL_MS = 16       # 60 FPS fallback tick interval
 COLLAPSE_DELAY_MS = 500     # Collapse grace period after mouse leaves
 UPDATE_INTERVAL_MS = 1000   # Polling interval for battery/media stats
 LYRIC_TICK_MS = 150         # 150ms lyric sync polling
@@ -128,7 +132,7 @@ window, .canvas-root {
 
 /* ── COMPACT MEDIA STATE (280x44) ── */
 .compact-box {
-    padding: 6px 14px 6px 12px;
+    padding: 4px 14px 4px 12px;
 }
 .compact-art {
     border-radius: 6px;
@@ -175,7 +179,7 @@ window, .canvas-root {
     margin-left: 6px;
 }
 
-/* ── EXPANDED MUSIC PLAYER VIEW (400x168 / 400x146) ── */
+/* ── EXPANDED MUSIC PLAYER VIEW (400x178 / 400x146) ── */
 .full-box {
     padding: 14px 20px 12px 20px;
 }
@@ -209,7 +213,7 @@ window, .canvas-root {
 
 /* Row 2: Subdued Lyric Preview */
 .lyric-row {
-    padding: 2px 0 2px 0;
+    padding: 0;
 }
 .full-lyric {
     color: #A1A1A8;
@@ -294,6 +298,29 @@ button.ctrl-btn-play:hover {
     background-color: rgba(255, 255, 255, 0.12);
     color: #FFFFFF;
 }
+
+/* Persistent Bluetooth Headset UI */
+.full-bt-box {
+    margin-right: 6px;
+}
+.full-bt-name {
+    color: #F5F5F7;
+    font-size: 11px;
+    font-weight: 500;
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Inter", sans-serif;
+}
+.full-bt-battery {
+    color: #A1A1A8;
+    font-size: 9.5px;
+    font-weight: 400;
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Inter", sans-serif;
+}
+.empty-bt-label {
+    color: #A1A1A8;
+    font-size: 10.5px;
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Inter", sans-serif;
+    margin-left: 8px;
+}
 """
 
 # ─────────────────────────────────────────────────────────────
@@ -320,21 +347,87 @@ def format_time(microseconds: int) -> str:
     m, s = divmod(s, 60)
     return f"{m}:{s:02d}"
 
+def _anim_curve(progress: float, is_expanding: bool = True) -> float:
+    """Organic critically damped spring curve with zero overshoot and smooth takeoff.
+
+    - Expanding: omega = 6.5 (soft organic fluid bloom over ~300 ms).
+    - Collapsing: omega = 7.5 (snappy, cushioned retraction over ~250 ms).
+    Guaranteed boundary conditions: f(0.0) == 0.0, f(1.0) == 1.0, strictly monotonic.
+    """
+    if progress <= 0.0:
+        return 0.0
+    if progress >= 1.0:
+        return 1.0
+    omega = 6.5 if is_expanding else 7.5
+    raw = 1.0 - (1.0 + omega * progress) * math.exp(-omega * progress)
+    norm = 1.0 - (1.0 + omega) * math.exp(-omega)
+    return raw / norm
+
 # ─────────────────────────────────────────────────────────────
 #  PIPEWIRE AUDIO LEVEL MONITOR (Audio-Reactive Equalizer)
 # ─────────────────────────────────────────────────────────────
+class BiquadBandpass:
+    """Second-order IIR Biquad Bandpass filter with constant 0 dB peak gain.
+    Provides wide, musical frequency-region energy integration around anchor frequencies.
+    """
+    def __init__(self, f0: float, Q: float = 1.2, fs: float = 8000.0):
+        self.f0 = f0
+        self.Q = Q
+        self.fs = fs
+        w0 = 2.0 * math.pi * f0 / fs
+        alpha = math.sin(w0) / (2.0 * Q)
+        b0 = math.sin(w0) / 2.0
+        a0 = 1.0 + alpha
+        a1 = -2.0 * math.cos(w0)
+        a2 = 1.0 - alpha
+        self.b0 = b0 / a0
+        self.b2 = -b0 / a0
+        self.a1 = a1 / a0
+        self.a2 = a2 / a0
+        self.reset()
+
+    def reset(self):
+        self.x1 = 0.0
+        self.x2 = 0.0
+        self.y1 = 0.0
+        self.y2 = 0.0
+
+    def process(self, samples) -> float:
+        """Processes samples through the filter and returns mean squared energy."""
+        if not samples:
+            return 0.0
+        energy = 0.0
+        b0, b2, a1, a2 = self.b0, self.b2, self.a1, self.a2
+        x1, x2, y1, y2 = self.x1, self.x2, self.y1, self.y2
+        for x in samples:
+            y = b0 * (x - x2) - a1 * y1 - a2 * y2
+            x2, x1 = x1, x
+            y2, y1 = y1, y
+            energy += y * y
+        self.x1, self.x2, self.y1, self.y2 = x1, x2, y1, y2
+        return energy / max(1, len(samples))
+
+
 class AudioLevelMonitor:
     """Captures real-time audio from default PipeWire audio sink monitor stream.
-    Computes 3-band energy (Bass ~160Hz, Mid ~800Hz, Treble ~2400Hz) using Goertzel algorithm.
-    Thread-safe, non-blocking, with graceful fallback.
+    Computes 3-band energy (Bass ~160Hz, Mid ~800Hz, Treble ~2400Hz) using 2nd-order
+    IIR Biquad bandpass filter bank with perceptual loudness mapping and peak tracking.
+    Thread-safe, non-blocking, follows default sink changes (speakers <-> Bluetooth TWS),
+    with graceful fallback.
     """
     def __init__(self):
         self._lock = threading.Lock()
+        self._bp_bass = BiquadBandpass(160.0, Q=1.2, fs=8000.0)
+        self._bp_mid = BiquadBandpass(800.0, Q=1.2, fs=8000.0)
+        self._bp_treble = BiquadBandpass(2400.0, Q=1.2, fs=8000.0)
+        self._peak = 1200.0
         self._levels = [0.25, 0.25, 0.25]
         self._is_playing = False
         self._running = True
         self._proc = None
         self._source_name = "Initializing..."
+        self._current_sink_name = None
+        self._restart_requested = False
         self._thread = threading.Thread(target=self._worker, daemon=True)
         self._thread.start()
 
@@ -350,9 +443,30 @@ class AudioLevelMonitor:
         with self._lock:
             return self._source_name
 
+    def reset_filters(self):
+        """Resets filter memories, peak tracker, and resting levels."""
+        with self._lock:
+            if hasattr(self, "_bp_bass") and self._bp_bass is not None:
+                self._bp_bass.reset()
+            if hasattr(self, "_bp_mid") and self._bp_mid is not None:
+                self._bp_mid.reset()
+            if hasattr(self, "_bp_treble") and self._bp_treble is not None:
+                self._bp_treble.reset()
+            self._peak = 1200.0
+            self._levels = [0.25, 0.25, 0.25]
+
     def stop(self):
         self._running = False
+        self._stop_recorder()
+        if hasattr(self, "_thread") and self._thread.is_alive() and threading.current_thread() != self._thread:
+            try:
+                self._thread.join(timeout=0.5)
+            except Exception:
+                pass
+
+    def _stop_recorder(self):
         with self._lock:
+            self._restart_requested = True
             proc = self._proc
             self._proc = None
         if proc:
@@ -369,6 +483,11 @@ class AudioLevelMonitor:
                     proc.stdout.close()
             except Exception:
                 pass
+        self.reset_filters()
+
+    def restart_recorder(self):
+        """Signals worker to cleanly terminate and restart recorder on active sink."""
+        self._stop_recorder()
 
     @staticmethod
     def compute_goertzel(samples, target_freq: float, sample_rate: float = 8000.0) -> float:
@@ -387,6 +506,140 @@ class AudioLevelMonitor:
             s_prev = s
         return max(0.0, s_prev2 * s_prev2 + s_prev * s_prev - coeff * s_prev * s_prev2)
 
+    def process_samples(self, samples, is_playing: bool = True) -> list:
+        """Processes a 256-sample PCM chunk and returns updated [bass, mid, treble] levels in [0.0, 1.0]."""
+        with self._lock:
+            cur_levels = list(self._levels)
+            peak = self._peak
+
+        if not is_playing or not samples:
+            for j in range(3):
+                cur_levels[j] = cur_levels[j] * 0.82 + 0.25 * 0.18
+            with self._lock:
+                self._levels = list(cur_levels)
+            return list(cur_levels)
+
+        rms = math.sqrt(sum(s * s for s in samples) / max(1, len(samples)))
+        if rms < 35.0:  # Silence or near noise floor
+            for j in range(3):
+                cur_levels[j] = cur_levels[j] * 0.82 + 0.25 * 0.18
+            with self._lock:
+                self._levels = list(cur_levels)
+            return list(cur_levels)
+
+        e_b = self._bp_bass.process(samples)
+        e_m = self._bp_mid.process(samples)
+        e_t = self._bp_treble.process(samples)
+
+        # Treble pink noise tilt compensation
+        amps = [
+            math.sqrt(max(0.0, e_b)),
+            math.sqrt(max(0.0, e_m)),
+            math.sqrt(max(0.0, e_t)) * 1.15,
+        ]
+
+        # Shared peak follower preserves inter-band spectral balance
+        peak = max(1200.0, max(peak * 0.993, max(amps)))
+        noise_floor = 20.0
+        denom = max(1.0, peak - noise_floor)
+
+        for j in range(3):
+            usable = max(0.0, amps[j] - noise_floor)
+            ratio = min(1.0, usable / denom)
+            comp = ratio ** 0.65  # Perceptual dynamic compression
+            target = 0.20 + 0.75 * comp
+
+            # Asymmetric attack/release smoothing
+            if target > cur_levels[j]:
+                cur_levels[j] = cur_levels[j] * 0.35 + target * 0.65
+            else:
+                cur_levels[j] = cur_levels[j] * 0.82 + target * 0.18
+
+        with self._lock:
+            self._peak = peak
+            self._levels = list(cur_levels)
+
+        return list(cur_levels)
+
+    def get_default_sink_info(self):
+        """Queries WirePlumber for active default audio sink name and description."""
+        try:
+            out = subprocess.check_output(
+                ["wpctl", "inspect", "@DEFAULT_AUDIO_SINK@"],
+                stderr=subprocess.DEVNULL,
+                timeout=1.0
+            ).decode("utf-8")
+            node_name = None
+            node_desc = None
+            for line in out.splitlines():
+                line = line.strip()
+                if "node.name =" in line:
+                    node_name = line.split("=")[1].strip().strip('"')
+                elif "node.description =" in line:
+                    node_desc = line.split("=")[1].strip().strip('"')
+            return node_name, node_desc
+        except Exception:
+            return None, None
+
+    def get_recorder_sources(self):
+        """Inspects actual PipeWire links feeding pw-record input ports."""
+        try:
+            out = subprocess.check_output(
+                ["pw-link", "-l"],
+                stderr=subprocess.DEVNULL,
+                timeout=1.0
+            ).decode("utf-8")
+            sources = set()
+            current_dest = None
+            for line in out.splitlines():
+                line_s = line.strip()
+                if line_s.startswith("|<- "):
+                    src = line_s[4:].strip()
+                    if current_dest and "pw-record" in current_dest:
+                        sources.add(src)
+                elif not line.startswith(" "):
+                    current_dest = line.strip()
+            return sources
+        except Exception:
+            return set()
+
+    def check_default_sink(self):
+        """Checks if current capture is attached to active default sink monitor."""
+        if not self._running:
+            return
+
+        sink_name, sink_desc = self.get_default_sink_info()
+        if not sink_name:
+            return
+
+        with self._lock:
+            proc = self._proc
+
+        if not proc or proc.poll() is not None:
+            self.restart_recorder()
+            return
+
+        sources = self.get_recorder_sources()
+        if not sources:
+            return
+
+        is_correct = True
+        has_mic = False
+        for s in sources:
+            if ":" in s:
+                node, port = s.rsplit(":", 1)
+                if "capture" in port.lower():
+                    has_mic = True
+                if node != sink_name:
+                    is_correct = False
+
+        if has_mic or not is_correct:
+            self.restart_recorder()
+        else:
+            with self._lock:
+                self._current_sink_name = sink_name
+                self._source_name = f"PipeWire ({sink_desc or sink_name})"
+
     def _worker(self):
         pw_path = shutil.which("pw-record")
         if not pw_path:
@@ -395,108 +648,122 @@ class AudioLevelMonitor:
             self._fallback_loop()
             return
 
-        cmd = [
-            pw_path,
-            "--target", "@DEFAULT_AUDIO_SINK@",
-            "--latency", "32ms",
-            "--rate", "8000",
-            "--channels", "1",
-            "--format", "s16",
-            "--raw", "-"
-        ]
-
-        try:
-            proc = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-                bufsize=1024
-            )
+        while self._running:
             with self._lock:
-                self._proc = proc
-                self._source_name = "PipeWire monitor stream (@DEFAULT_AUDIO_SINK@)"
-        except Exception as e:
-            with self._lock:
-                self._source_name = f"Fallback ({e})"
-            self._fallback_loop()
-            return
+                self._restart_requested = False
 
-        peaks = [1e6, 1e6, 1e6]
-        cur_levels = [0.25, 0.25, 0.25]
-        chunk_bytes = 512  # 256 samples of 16-bit PCM = 32ms
+            sink_name, sink_desc = self.get_default_sink_info()
+            sink_label = sink_desc or sink_name or "@DEFAULT_AUDIO_SINK@"
 
-        try:
-            while self._running:
-                try:
-                    raw = proc.stdout.read(chunk_bytes)
-                    if not raw or len(raw) < chunk_bytes:
+            cmd = [
+                pw_path,
+                "--media-category=Monitor",
+                "-P", '{ stream.capture.sink: true }',
+                "--target", "@DEFAULT_AUDIO_SINK@",
+                "--latency", "32ms",
+                "--rate", "8000",
+                "--channels", "1",
+                "--format", "s16",
+                "--raw", "-"
+            ]
+
+            proc = None
+            try:
+                proc = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    bufsize=1024
+                )
+                with self._lock:
+                    self._proc = proc
+                    self._current_sink_name = sink_name
+                    self._source_name = f"PipeWire ({sink_label})"
+            except Exception as e:
+                with self._lock:
+                    self._source_name = f"Fallback ({e})"
+                self._run_fallback_ticks(duration_sec=0.5)
+                continue
+
+            chunk_bytes = 512  # 256 samples of 16-bit PCM = 32ms at 8000 Hz mono
+            buf = bytearray()
+            chunk_count = 0
+
+            try:
+                while self._running:
+                    with self._lock:
+                        if self._restart_requested:
+                            break
+
+                    needed = chunk_bytes - len(buf)
+                    try:
+                        raw = proc.stdout.read(needed)
+                    except Exception:
+                        break
+
+                    if not raw:
                         if proc.poll() is not None:
                             break  # Subprocess exited or audio sink disconnected
-                        time.sleep(0.02)
+                        time.sleep(0.01)
                         continue
 
-                    samples = struct.unpack("<256h", raw)
-                    rms = math.sqrt(sum(s * s for s in samples) / 256.0)
+                    buf.extend(raw)
+                    if len(buf) < chunk_bytes:
+                        continue
 
+                    chunk = bytes(buf[:chunk_bytes])
+                    del buf[:chunk_bytes]
+
+                    chunk_count += 1
+                    if chunk_count % 30 == 0:
+                        self.check_default_sink()
+                        with self._lock:
+                            if self._restart_requested:
+                                break
+
+                    samples = struct.unpack("<256h", chunk)
                     with self._lock:
                         is_play = self._is_playing
 
-                    if not is_play or rms < 45.0:
-                        for j in range(3):
-                            cur_levels[j] = cur_levels[j] * 0.88 + 0.25 * 0.12
-                    else:
-                        powers = [
-                            self.compute_goertzel(samples, 160),   # Bass (~160 Hz)
-                            self.compute_goertzel(samples, 800),   # Mid (~800 Hz)
-                            self.compute_goertzel(samples, 2400)  # Treble (~2400 Hz)
-                        ]
-                        for j in range(3):
-                            peaks[j] = max(powers[j], peaks[j] * 0.992)
-                            raw_norm = math.sqrt(powers[j] / max(peaks[j], 1.0))
-                            target = 0.15 + 0.85 * min(1.0, max(0.0, raw_norm ** 0.72))
-                            if target > cur_levels[j]:
-                                cur_levels[j] = cur_levels[j] * 0.35 + target * 0.65
-                            else:
-                                cur_levels[j] = cur_levels[j] * 0.84 + target * 0.16
+                    self.process_samples(samples, is_playing=is_play)
 
-                    with self._lock:
-                        self._levels = list(cur_levels)
+            except Exception:
+                time.sleep(0.05)
+            finally:
+                if proc:
+                    try:
+                        proc.terminate()
+                        proc.wait(timeout=0.2)
+                    except Exception:
+                        try:
+                            proc.kill()
+                        except Exception:
+                            pass
+                    try:
+                        if proc.stdout:
+                            proc.stdout.close()
+                    except Exception:
+                        pass
+                with self._lock:
+                    if self._proc == proc:
+                        self._proc = None
 
-                except Exception:
-                    time.sleep(0.05)
-        finally:
-            with self._lock:
-                p = self._proc
-                self._proc = None
-            if p:
-                try:
-                    p.terminate()
-                    p.wait(timeout=0.2)
-                except Exception:
-                    pass
-                try:
-                    if p.stdout:
-                        p.stdout.close()
-                except Exception:
-                    pass
+            if self._running:
+                self._run_fallback_ticks(duration_sec=0.2)
 
-        if self._running:
-            with self._lock:
-                self._source_name = "Pseudo-reactive fallback (audio stream disconnected)"
-            self._fallback_loop()
-
-    def _fallback_loop(self):
+    def _run_fallback_ticks(self, duration_sec: float = 0.5):
+        """Smoothly decays or animates levels during transitions or when audio stream reconnects."""
+        end_time = time.time() + duration_sec
         cur_levels = [0.25, 0.25, 0.25]
-        t = 0.0
-        while self._running:
+        while self._running and time.time() < end_time:
             time.sleep(0.033)
-            t += 0.033
             with self._lock:
                 is_play = self._is_playing
             if not is_play:
                 for j in range(3):
                     cur_levels[j] = cur_levels[j] * 0.88 + 0.25 * 0.12
             else:
+                t = time.time()
                 targets = [
                     0.25 + 0.65 * (math.sin(t * 8.0) ** 2),
                     0.20 + 0.75 * (math.sin(t * 12.0 + 1.2) ** 2),
@@ -506,6 +773,11 @@ class AudioLevelMonitor:
                     cur_levels[j] = cur_levels[j] * 0.4 + targets[j] * 0.6
             with self._lock:
                 self._levels = list(cur_levels)
+
+    def _fallback_loop(self):
+        """Permanent fallback loop when pw-record binary is completely unavailable."""
+        while self._running:
+            self._run_fallback_ticks(duration_sec=1.0)
 
 # ─────────────────────────────────────────────────────────────
 #  MEDIA ACTIVITY EQUALIZER INDICATOR (Apple Music-style Wave)
@@ -799,44 +1071,309 @@ class VolumeController:
 #  BLUETOOTH TWS & LAPTOP BATTERY
 # ─────────────────────────────────────────────────────────────
 class BluetoothBattery:
-    _AUDIO_ICONS = {"audio-headphones", "audio-headset", "audio-card"}
+    """Monitors connected Bluetooth audio headsets/TWS devices via BlueZ D-Bus and laptop battery.
 
-    def __init__(self):
+    Features:
+    - Queries BlueZ D-Bus (org.bluez) for connected audio devices.
+    - Retrieves device Alias (preferred) or Name (fallback), suppressing raw MAC addresses.
+    - Reads org.bluez.Battery1 Percentage and Source.
+    - Supports multiple battery components (left, right, case) via Identifier property when exposed.
+    - Dispatches live updates on connection, disconnection, and battery percentage changes.
+    - Idempotent cleanup of D-Bus signal matches on shutdown.
+    - Laptop battery fallback via /sys/class/power_supply.
+    """
+    AUDIO_SHORT_UUIDS = ("110b", "110a", "111e", "1108", "110c", "110e")
+    AUDIO_ICONS = {"audio-headphones", "audio-headset", "audio-card"}
+
+    def __init__(self, on_change_callback=None):
+        self._on_change_callback = on_change_callback
         self._bus = None
+        self._signal_matches = []
+        self._connected_headsets = {}  # dev_path -> dict
+        self._primary_headset_path = None
+        self._notified_low_batteries = set()
+
         try:
             self._bus = dbus.SystemBus()
+            self._setup_signals()
+            self._refresh_headsets()
         except Exception:
             self._bus = None
 
-    def get_info(self):
-        # 1. Bluetooth Headphones / TWS check
-        if self._bus is None:
-            try:
-                self._bus = dbus.SystemBus()
-            except Exception:
-                self._bus = None
+    def _setup_signals(self):
+        if not self._bus:
+            return
+        try:
+            # Monitor property changes (Connected, Percentage, Alias)
+            m1 = self._bus.add_signal_receiver(
+                self._on_properties_changed,
+                signal_name="PropertiesChanged",
+                dbus_interface="org.freedesktop.DBus.Properties",
+                path_keyword="path"
+            )
+            self._signal_matches.append(m1)
 
-        if self._bus is not None:
-            try:
-                mgr = dbus.Interface(
-                    self._bus.get_object("org.bluez", "/"),
-                    "org.freedesktop.DBus.ObjectManager"
-                )
-                for path, ifaces in mgr.GetManagedObjects().items():
-                    if "org.bluez.Battery1" in ifaces:
-                        pct = int(ifaces["org.bluez.Battery1"].get("Percentage", 0))
-                        dev = ifaces.get("org.bluez.Device1", {})
-                        name = str(dev.get("Name", "TWS"))[:12] if dev else "TWS"
-                        return {"name": name, "percent": pct, "is_laptop": False, "charging": False}
-                    if "org.bluez.Device1" in ifaces:
-                        dev = ifaces["org.bluez.Device1"]
-                        if dev.get("Connected") and str(dev.get("Icon", "")) in self._AUDIO_ICONS:
-                            name = str(dev.get("Name", "TWS"))[:12]
-                            return {"name": name, "percent": -1, "is_laptop": False, "charging": False}
-            except Exception:
-                pass
+            # Monitor interface additions (e.g. Battery1 appearing after connection)
+            m2 = self._bus.add_signal_receiver(
+                self._on_interfaces_added,
+                signal_name="InterfacesAdded",
+                dbus_interface="org.freedesktop.DBus.ObjectManager",
+                path_keyword="signal_path"
+            )
+            self._signal_matches.append(m2)
 
-        # 2. Laptop Battery fallback
+            # Monitor interface removals (e.g. device disconnected)
+            m3 = self._bus.add_signal_receiver(
+                self._on_interfaces_removed,
+                signal_name="InterfacesRemoved",
+                dbus_interface="org.freedesktop.DBus.ObjectManager",
+                path_keyword="signal_path"
+            )
+            self._signal_matches.append(m3)
+
+            # Monitor BlueZ service lifecycle
+            m4 = self._bus.add_signal_receiver(
+                self._on_name_owner_changed,
+                signal_name="NameOwnerChanged",
+                dbus_interface="org.freedesktop.DBus"
+            )
+            self._signal_matches.append(m4)
+        except Exception:
+            pass
+
+    def _on_name_owner_changed(self, name, old_owner, new_owner):
+        if name == "org.bluez":
+            if not new_owner:
+                self._connected_headsets.clear()
+                self._primary_headset_path = None
+                if self._on_change_callback:
+                    self._on_change_callback("disconnected", {"name": "Bluetooth Headset"})
+            else:
+                refreshed = self._refresh_headsets()
+                if refreshed is not None:
+                    self._connected_headsets = refreshed
+                primary = self.get_headset_info()
+                if primary and self._on_change_callback:
+                    self._on_change_callback("connected", primary)
+
+    def _is_mac_address(self, s: str) -> bool:
+        if not s:
+            return False
+        clean = s.replace("_", ":").replace("-", ":")
+        parts = clean.split(":")
+        if len(parts) == 6 and all(len(p) == 2 and all(c in "0123456789abcdefABCDEF" for c in p) for p in parts):
+            return True
+        return s.lower().startswith("dev_")
+
+    def _get_device_display_name(self, dev: dict) -> str:
+        alias = dev.get("Alias")
+        if alias:
+            name = str(alias).strip()
+            if name and not self._is_mac_address(name):
+                return name
+        name_prop = dev.get("Name")
+        if name_prop:
+            name = str(name_prop).strip()
+            if name and not self._is_mac_address(name):
+                return name
+        return "Bluetooth Headset"
+
+    def _is_audio_device(self, dev: dict) -> bool:
+        icon = str(dev.get("Icon", "")).lower()
+        if icon in self.AUDIO_ICONS or icon.startswith("audio-"):
+            return True
+        try:
+            cod = int(dev.get("Class", 0))
+            if (cod & 0x1F00) == 0x0400 or (cod & 0x200000) != 0:
+                return True
+        except Exception:
+            pass
+        uuids = [str(u).lower() for u in dev.get("UUIDs", [])]
+        for u in uuids:
+            for s in self.AUDIO_SHORT_UUIDS:
+                if s in u:
+                    return True
+        return False
+
+    def _extract_battery(self, dev_path: str, all_objects: dict) -> tuple[int | None, str, dict]:
+        """Extracts battery percentage, readable string, and components for a device path."""
+        components = {}
+        aggregate_pct = None
+        aggregate_source = None
+
+        for path, ifaces in all_objects.items():
+            if path == dev_path or str(path).startswith(str(dev_path) + "/"):
+                if "org.bluez.Battery1" in ifaces:
+                    bat = ifaces["org.bluez.Battery1"]
+                    ident = str(bat.get("Identifier", "")).lower().strip()
+                    pct = None
+                    if "Percentage" in bat:
+                        try:
+                            raw_pct = int(bat["Percentage"])
+                            if 0 <= raw_pct <= 100:
+                                pct = raw_pct
+                        except Exception:
+                            pct = None
+                    source = str(bat.get("Source", "")) if "Source" in bat else None
+
+                    if ident:
+                        components[ident] = {
+                            "percent": pct,
+                            "source": source
+                        }
+                    else:
+                        if pct is not None:
+                            aggregate_pct = pct
+                        if source:
+                            aggregate_source = source
+
+        comp_parts = []
+        for key, label in [("left", "L"), ("right", "R"), ("case", "Case")]:
+            if key in components and components[key]["percent"] is not None:
+                comp_parts.append(f"{label}: {components[key]['percent']}%")
+        for key, val in components.items():
+            if key not in ("left", "right", "case") and val["percent"] is not None:
+                comp_parts.append(f"{key.capitalize()}: {val['percent']}%")
+
+        if comp_parts:
+            battery_text = " · ".join(comp_parts)
+            primary_pct = aggregate_pct
+            if primary_pct is None:
+                valid_pcts = [v["percent"] for v in components.values() if v["percent"] is not None]
+                primary_pct = valid_pcts[0] if valid_pcts else None
+            return primary_pct, battery_text, components
+
+        if aggregate_pct is not None:
+            return aggregate_pct, f"{aggregate_pct}%", components
+
+        return None, "Battery unavailable", components
+
+    def _refresh_headsets(self):
+        if not self._bus:
+            return {}
+        try:
+            mgr = dbus.Interface(
+                self._bus.get_object("org.bluez", "/"),
+                "org.freedesktop.DBus.ObjectManager"
+            )
+            objs = mgr.GetManagedObjects()
+        except Exception:
+            return {}
+
+        return self._refresh_headsets_from_objects(objs)
+
+    def _refresh_headsets_from_objects(self, objs: dict) -> dict:
+        new_headsets = {}
+        for path, ifaces in objs.items():
+            if "org.bluez.Device1" in ifaces:
+                dev = ifaces["org.bluez.Device1"]
+                if dev.get("Connected") and self._is_audio_device(dev):
+                    name = self._get_device_display_name(dev)
+                    pct, bat_text, comps = self._extract_battery(path, objs)
+                    new_headsets[path] = {
+                        "name": name,
+                        "percent": pct,
+                        "battery_text": bat_text,
+                        "components": comps,
+                        "is_laptop": False,
+                        "connected": True,
+                        "charging": False,
+                        "path": path,
+                    }
+
+        self._connected_headsets = new_headsets
+        return new_headsets
+
+    def _on_properties_changed(self, iface, changed, invalidated, path=None, signal_path=None):
+        target_path = signal_path if signal_path is not None else path
+        if iface == "org.bluez.Device1":
+            if "Connected" in changed:
+                connected = bool(changed["Connected"])
+                if connected:
+                    refreshed = self._refresh_headsets()
+                    if target_path in refreshed:
+                        info = refreshed[target_path]
+                        if self._on_change_callback:
+                            self._on_change_callback("connected", info)
+                else:
+                    if target_path in self._connected_headsets:
+                        info = self._connected_headsets.pop(target_path)
+                        self._notified_low_batteries.discard(target_path)
+                        if self._primary_headset_path == target_path:
+                            self._primary_headset_path = None
+                        if self._on_change_callback:
+                            self._on_change_callback("disconnected", info)
+            elif "Alias" in changed or "Name" in changed:
+                if target_path in self._connected_headsets:
+                    new_name = self._get_device_display_name(changed)
+                    self._connected_headsets[target_path]["name"] = new_name
+
+        elif iface == "org.bluez.Battery1":
+            target_dev = None
+            for dev_path in self._connected_headsets:
+                if target_path == dev_path or (target_path and str(target_path).startswith(str(dev_path) + "/")):
+                    target_dev = dev_path
+                    break
+
+            if target_dev:
+                refreshed = self._refresh_headsets()
+                if target_dev in refreshed:
+                    info = refreshed[target_dev]
+                    if self._on_change_callback:
+                        self._on_change_callback("battery_changed", info)
+
+                    pct = info.get("percent")
+                    if pct is not None and pct <= 20:
+                        if target_dev not in self._notified_low_batteries:
+                            self._notified_low_batteries.add(target_dev)
+                            if self._on_change_callback:
+                                self._on_change_callback("low_battery", info)
+                    elif pct is not None and pct > 20:
+                        self._notified_low_batteries.discard(target_dev)
+
+    def _on_interfaces_added(self, object_path, interfaces, signal_path=None):
+        if "org.bluez.Battery1" in interfaces or "org.bluez.Device1" in interfaces:
+            was_known = object_path in self._connected_headsets
+            refreshed = self._refresh_headsets()
+            for dev_path, info in refreshed.items():
+                if object_path == dev_path or str(object_path).startswith(str(dev_path) + "/"):
+                    if self._on_change_callback:
+                        event_type = "connected" if (not was_known and object_path == dev_path) else "battery_changed"
+                        self._on_change_callback(event_type, info)
+                    break
+
+    def _on_interfaces_removed(self, object_path, interfaces, signal_path=None):
+        if "org.bluez.Device1" in interfaces and object_path in self._connected_headsets:
+            info = self._connected_headsets.pop(object_path)
+            self._notified_low_batteries.discard(object_path)
+            if self._primary_headset_path == object_path:
+                self._primary_headset_path = None
+            if self._on_change_callback:
+                self._on_change_callback("disconnected", info)
+        elif "org.bluez.Battery1" in interfaces:
+            target_dev = None
+            for dev_path in self._connected_headsets:
+                if object_path == dev_path or str(object_path).startswith(str(dev_path) + "/"):
+                    target_dev = dev_path
+                    break
+            if target_dev:
+                refreshed = self._refresh_headsets()
+                if target_dev in refreshed and self._on_change_callback:
+                    self._on_change_callback("battery_changed", refreshed[target_dev])
+
+    def get_headset_info(self):
+        """Returns info for the primary connected headset, or None."""
+        if not self._connected_headsets:
+            self._refresh_headsets()
+        if not self._connected_headsets:
+            self._primary_headset_path = None
+            return None
+        if self._primary_headset_path not in self._connected_headsets:
+            self._primary_headset_path = sorted(self._connected_headsets.keys())[0]
+        return self._connected_headsets[self._primary_headset_path]
+
+    def get_laptop_battery(self):
+        """Returns laptop battery info, or None."""
         try:
             caps = glob.glob("/sys/class/power_supply/BAT*/capacity")
             if caps:
@@ -848,10 +1385,36 @@ class BluetoothBattery:
                     with open(stats[0], "r") as f:
                         status = f.read().strip()
                 charging = (status == "Charging")
-                return {"name": "Laptop", "percent": cap, "is_laptop": True, "charging": charging}
+                return {
+                    "name": "Laptop",
+                    "percent": cap,
+                    "battery_text": f"{cap}%",
+                    "components": {},
+                    "is_laptop": True,
+                    "connected": False,
+                    "charging": charging,
+                }
         except Exception:
             pass
         return None
+
+    def get_info(self):
+        """Returns connected headset info if available, otherwise laptop battery."""
+        headset = self.get_headset_info()
+        if headset:
+            return headset
+        return self.get_laptop_battery()
+
+    def close(self):
+        for match in self._signal_matches:
+            try:
+                match.remove()
+            except Exception:
+                pass
+        self._signal_matches.clear()
+        self._connected_headsets.clear()
+        self._primary_headset_path = None
+        self._notified_low_batteries.clear()
 
 # ─────────────────────────────────────────────────────────────
 #  ROBUST MULTI-STAGE SYNCED LYRICS CONTROLLER (LRCLIB)
@@ -1125,6 +1688,8 @@ class CinemaModeController:
     2. Built-in low-latency XWayland/X11 detector querying _NET_ACTIVE_WINDOW & _NET_CLIENT_LIST
     3. Manual override file (/tmp/dynamic_notch_cinema_override)
     """
+    OVERRIDE_FILE = "/tmp/dynamic_notch_cinema_override"
+
     def __init__(self, on_change_callback=None):
         self._on_change_callback = on_change_callback
         self._is_fullscreen = False
@@ -1184,7 +1749,8 @@ class CinemaModeController:
 
     def check_fullscreen(self) -> bool:
         # Check manual file override first
-        if os.path.exists("/tmp/dynamic_notch_cinema_override"):
+        override_path = getattr(self, "_override_file", self.OVERRIDE_FILE)
+        if os.path.exists(override_path):
             return True
 
         # Check D-Bus bridge state
@@ -1284,7 +1850,7 @@ class DynamicIslandWindow(Gtk.Window):
 
         self.media = MediaController(on_change_callback=self._on_tick)
         self.vol = VolumeController()
-        self.bt = BluetoothBattery()
+        self.bt = BluetoothBattery(on_change_callback=self._on_bt_event)
         self.lyrics = LyricsController()
 
         self._state = self.STATE_IDLE
@@ -1299,6 +1865,9 @@ class DynamicIslandWindow(Gtk.Window):
         self._anim_target_h = float(IDLE_H)
         self._anim_start_time = 0.0
         self._anim_running = False
+        self._anim_is_expanding = True
+        self._anim_duration_ms = float(ANIM_EXPAND_MS)
+        self._anim_tick_id = None
 
         self._tick_timer = None
         self._lyric_timer = None
@@ -1312,6 +1881,7 @@ class DynamicIslandWindow(Gtk.Window):
         self._last_info = {}
         self._last_battery_state = None
         self._low_battery_notified = False
+        self._persistent_bt_device = None
 
         self._seek_blocked = False
 
@@ -1342,6 +1912,7 @@ class DynamicIslandWindow(Gtk.Window):
         self._notif_box.set_visible(False)
         self._idle_box.set_visible(True)
         self._update_input_shape(IDLE_W, IDLE_H)
+        self._update_persistent_bt(self.bt.get_headset_info())
 
         if self._cinema.check_fullscreen():
             self._enter_cinema_suppression()
@@ -1355,11 +1926,22 @@ class DynamicIslandWindow(Gtk.Window):
 
         self._start_water_reminder()
 
+        # Check initial connected headset status shortly after launch
+        GLib.timeout_add(1000, self._check_initial_headset)
+
         self.connect("delete-event", self._on_delete)
 
     def _cancel_timer(self, attr_name: str):
         if attr_name == "_anim_timer":
             self._anim_running = False
+            tick_id = getattr(self, "_anim_tick_id", None)
+            if tick_id is not None:
+                try:
+                    if hasattr(self, "remove_tick_callback"):
+                        self.remove_tick_callback(tick_id)
+                except Exception:
+                    pass
+                self._anim_tick_id = None
         timer_id = getattr(self, attr_name, None)
         if timer_id is not None:
             try:
@@ -1437,6 +2019,102 @@ class DynamicIslandWindow(Gtk.Window):
             self.full_activity.tick()
         return True
 
+    def _update_persistent_bt(self, headset_info: dict | None):
+        if headset_info and headset_info.get("connected"):
+            self._persistent_bt_device = dict(headset_info)
+        else:
+            self._persistent_bt_device = None
+        self._refresh_bt_ui()
+        self.queue_draw()
+
+    def _refresh_bt_ui(self):
+        dev = self._persistent_bt_device
+        if dev and dev.get("connected"):
+            name = dev.get("name") or "Headset"
+            pct = dev.get("percent")
+            comps = dev.get("components") or {}
+
+            # Expanded battery formatting:
+            # Component levels if genuinely exposed, else "Battery X%", else "Battery unavailable"
+            if comps:
+                comp_parts = []
+                for key, label in [("left", "L"), ("right", "R"), ("case", "Case")]:
+                    if key in comps and comps[key].get("percent") is not None:
+                        comp_parts.append(f"{label}: {comps[key]['percent']}%")
+                bat_text = " · ".join(comp_parts) if comp_parts else ("Battery unavailable" if pct is None else f"Battery {pct}%")
+            elif pct is not None:
+                bat_text = f"Battery {pct}%"
+            else:
+                bat_text = "Battery unavailable"
+
+            if hasattr(self, "full_bt_name") and hasattr(self, "full_bt_battery"):
+                self.full_bt_name.set_text(f"🎧 {name}")
+                self.full_bt_battery.set_text(bat_text)
+                self.full_bt_box.set_visible(True)
+                if hasattr(self, "full_title"):
+                    self.full_title.set_max_width_chars(15)
+                if hasattr(self, "full_artist"):
+                    self.full_artist.set_max_width_chars(18)
+
+            if hasattr(self, "empty_bt_label"):
+                self.empty_bt_label.set_text(f"🎧 {name} · {bat_text}")
+                self.empty_bt_label.set_visible(True)
+        else:
+            if hasattr(self, "full_bt_name") and hasattr(self, "full_bt_battery"):
+                self.full_bt_name.set_text("")
+                self.full_bt_battery.set_text("")
+                self.full_bt_box.set_visible(False)
+                if hasattr(self, "full_title"):
+                    self.full_title.set_max_width_chars(26)
+                if hasattr(self, "full_artist"):
+                    self.full_artist.set_max_width_chars(30)
+
+            if hasattr(self, "empty_bt_label"):
+                self.empty_bt_label.set_text("")
+                self.empty_bt_label.set_visible(False)
+
+    def _on_bt_event(self, event_type: str, info: dict):
+        # 1. Update persistent state independently of notification state
+        if event_type in ("connected", "battery_changed"):
+            self._update_persistent_bt(info)
+            if event_type == "connected" and hasattr(self, "_audio_monitor") and self._audio_monitor:
+                self._audio_monitor.check_default_sink()
+        elif event_type == "disconnected":
+            self._update_persistent_bt(None)
+            if hasattr(self, "_audio_monitor") and self._audio_monitor:
+                self._audio_monitor.check_default_sink()
+
+        # 2. Transient notifications (suppressed in Cinema Mode or Expanded panel)
+        if self._is_cinema_suppressed or self._state in (self.STATE_CINEMA_SUPPRESSED, self.STATE_FULL):
+            return
+
+        name = info.get("name", "Headset")
+        pct = info.get("percent")
+        bat_text = info.get("battery_text", "")
+
+        if event_type == "connected":
+            sub = f"{bat_text} battery" if (pct is not None or info.get("components")) else "Connected · Battery unavailable"
+            self.show_notification("🎧", name, sub, duration_s=2.5)
+        elif event_type == "disconnected":
+            self.show_notification("🎧", name, "Disconnected", duration_s=2.0)
+        elif event_type == "low_battery":
+            sub = f"{pct}% remaining" if pct is not None else "Low battery"
+            self.show_notification("🪫", f"Low Battery: {name}", sub, duration_s=2.5)
+
+    def _check_initial_headset(self):
+        headset = self.bt.get_headset_info()
+        if headset and headset.get("connected"):
+            self._update_persistent_bt(headset)
+            if not (self._is_cinema_suppressed or self._state in (self.STATE_CINEMA_SUPPRESSED, self.STATE_FULL)):
+                name = headset.get("name", "Headset")
+                pct = headset.get("percent")
+                bat_text = headset.get("battery_text", "")
+                sub = f"{bat_text} battery" if (pct is not None or headset.get("components")) else "Connected · Battery unavailable"
+                self.show_notification("🎧", name, sub, duration_s=2.0)
+        else:
+            self._update_persistent_bt(None)
+        return False
+
     def _on_delete(self, *_):
         self._cancel_timer("_tick_timer")
         self._cancel_timer("_lyric_timer")
@@ -1446,11 +2124,14 @@ class DynamicIslandWindow(Gtk.Window):
         self._cancel_timer("_collapse_timer")
         self._cancel_timer("_notif_timer")
         self._cancel_timer("_water_reminder_timer")
+        if hasattr(self, "bt") and self.bt:
+            self.bt.close()
         if hasattr(self, "_cinema") and self._cinema:
             self._cinema.close()
         if hasattr(self, "_audio_monitor") and self._audio_monitor:
             self._audio_monitor.stop()
-        Gtk.main_quit()
+        if Gtk.main_level() > 0:
+            Gtk.main_quit()
         return False
 
     # ─────────────────────────────────────────────────────────
@@ -1685,6 +2366,12 @@ class DynamicIslandWindow(Gtk.Window):
         empty_label.get_style_context().add_class("empty-text")
         empty_label.set_valign(Gtk.Align.CENTER)
         self._empty_box.pack_start(empty_label, True, True, 0)
+
+        self.empty_bt_label = Gtk.Label(label="")
+        self.empty_bt_label.get_style_context().add_class("empty-bt-label")
+        self.empty_bt_label.set_valign(Gtk.Align.CENTER)
+        self.empty_bt_label.set_visible(False)
+        self._empty_box.pack_end(self.empty_bt_label, False, False, 0)
         self._overlay.add_overlay(self._empty_box)
 
         # ── 3. COMPACT PLAYING / PAUSED VIEW (240x40) ──
@@ -1713,19 +2400,28 @@ class DynamicIslandWindow(Gtk.Window):
         # Track metadata column (title + artist)
         compact_info_col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1)
         compact_info_col.set_valign(Gtk.Align.CENTER)
+        compact_info_col.set_hexpand(True)
         self._compact_box.pack_start(compact_info_col, True, True, 0)
 
         self.compact_title = Gtk.Label(label="")
         self.compact_title.get_style_context().add_class("compact-title")
-        self.compact_title.set_halign(Gtk.Align.START)
+        self.compact_title.set_single_line_mode(True)
+        self.compact_title.set_line_wrap(False)
         self.compact_title.set_ellipsize(Pango.EllipsizeMode.END)
+        self.compact_title.set_halign(Gtk.Align.FILL)
+        self.compact_title.set_xalign(0.0)
+        self.compact_title.set_hexpand(True)
         self.compact_title.set_max_width_chars(20)
         compact_info_col.pack_start(self.compact_title, False, False, 0)
 
         self.compact_artist = Gtk.Label(label="")
         self.compact_artist.get_style_context().add_class("compact-artist")
-        self.compact_artist.set_halign(Gtk.Align.START)
+        self.compact_artist.set_single_line_mode(True)
+        self.compact_artist.set_line_wrap(False)
         self.compact_artist.set_ellipsize(Pango.EllipsizeMode.END)
+        self.compact_artist.set_halign(Gtk.Align.FILL)
+        self.compact_artist.set_xalign(0.0)
+        self.compact_artist.set_hexpand(True)
         self.compact_artist.set_max_width_chars(22)
         compact_info_col.pack_start(self.compact_artist, False, False, 0)
 
@@ -1794,6 +2490,8 @@ class DynamicIslandWindow(Gtk.Window):
 
         self.full_title = Gtk.Label(label="Not Playing")
         self.full_title.get_style_context().add_class("full-title")
+        self.full_title.set_single_line_mode(True)
+        self.full_title.set_line_wrap(False)
         self.full_title.set_halign(Gtk.Align.START)
         self.full_title.set_ellipsize(Pango.EllipsizeMode.END)
         self.full_title.set_max_width_chars(26)
@@ -1801,6 +2499,8 @@ class DynamicIslandWindow(Gtk.Window):
 
         self.full_artist = Gtk.Label(label="Open Spotify to play")
         self.full_artist.get_style_context().add_class("full-artist")
+        self.full_artist.set_single_line_mode(True)
+        self.full_artist.set_line_wrap(False)
         self.full_artist.set_halign(Gtk.Align.START)
         self.full_artist.set_ellipsize(Pango.EllipsizeMode.END)
         self.full_artist.set_max_width_chars(30)
@@ -1811,16 +2511,46 @@ class DynamicIslandWindow(Gtk.Window):
         self.full_activity.set_valign(Gtk.Align.CENTER)
         row_hdr.pack_end(self.full_activity, False, False, 0)
 
-        # Row 2: Subdued Lyric Preview (hidden when no lyrics)
+        # Persistent Headset / TWS Status (top-right of header)
+        self.full_bt_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1)
+        self.full_bt_box.get_style_context().add_class("full-bt-box")
+        self.full_bt_box.set_valign(Gtk.Align.CENTER)
+        self.full_bt_box.set_halign(Gtk.Align.END)
+        self.full_bt_box.set_visible(False)
+
+        self.full_bt_name = Gtk.Label(label="")
+        self.full_bt_name.get_style_context().add_class("full-bt-name")
+        self.full_bt_name.set_halign(Gtk.Align.END)
+        self.full_bt_name.set_ellipsize(Pango.EllipsizeMode.END)
+        self.full_bt_name.set_max_width_chars(18)
+        self.full_bt_box.pack_start(self.full_bt_name, False, False, 0)
+
+        self.full_bt_battery = Gtk.Label(label="")
+        self.full_bt_battery.get_style_context().add_class("full-bt-battery")
+        self.full_bt_battery.set_halign(Gtk.Align.END)
+        self.full_bt_battery.set_ellipsize(Pango.EllipsizeMode.END)
+        self.full_bt_battery.set_max_width_chars(22)
+        self.full_bt_box.pack_start(self.full_bt_battery, False, False, 0)
+
+        row_hdr.pack_end(self.full_bt_box, False, False, 0)
+
+        # Row 2: Subdued Lyric Preview (hidden when no lyrics, 2-line reserved area)
         self._lyric_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
         self._lyric_row.get_style_context().add_class("lyric-row")
+        self._lyric_row.set_size_request(-1, 36)
         self._full_box.pack_start(self._lyric_row, False, False, 0)
 
         self._full_lyric_label = Gtk.Label(label="")
         self._full_lyric_label.get_style_context().add_class("full-lyric")
+        self._full_lyric_label.set_line_wrap(True)
+        self._full_lyric_label.set_line_wrap_mode(Pango.WrapMode.WORD_CHAR)
+        self._full_lyric_label.set_lines(2)
         self._full_lyric_label.set_ellipsize(Pango.EllipsizeMode.END)
-        self._full_lyric_label.set_max_width_chars(46)
-        self._full_lyric_label.set_halign(Gtk.Align.START)
+        self._full_lyric_label.set_halign(Gtk.Align.FILL)
+        self._full_lyric_label.set_hexpand(True)
+        self._full_lyric_label.set_xalign(0.0)
+        self._full_lyric_label.set_valign(Gtk.Align.CENTER)
+        self._full_lyric_label.set_max_width_chars(42)
         self._lyric_row.pack_start(self._full_lyric_label, True, True, 0)
 
         # Row 3: Seekbar & Timestamps
@@ -1920,7 +2650,7 @@ class DynamicIslandWindow(Gtk.Window):
             gdk_win.input_shape_combine_region(reg, 0, 0)
 
     # ─────────────────────────────────────────────────────────
-    #  60 FPS SMOOTH ANIMATION ENGINE (CUBIC EASE-OUT)
+    #  60 FPS SMOOTH ANIMATION ENGINE (FRAME-CLOCK DRIVEN DAMPED SPRING)
     # ─────────────────────────────────────────────────────────
     def _animate_to(self, target_state):
         if self._is_cinema_suppressed:
@@ -1958,6 +2688,11 @@ class DynamicIslandWindow(Gtk.Window):
         self._anim_target_h = target_h
         self._anim_start_time = 0.0  # Latch on first tick so pre-timer work does not consume animation budget
 
+        # Separate expand vs collapse durations
+        is_expanding = (target_w * target_h) >= (self._start_w * self._start_h)
+        self._anim_is_expanding = is_expanding
+        self._anim_duration_ms = float(ANIM_EXPAND_MS if is_expanding else ANIM_COLLAPSE_MS)
+
         active_boxes = {
             self.STATE_IDLE: self._idle_box,
             self.STATE_COMPACT: self._compact_box,
@@ -1984,23 +2719,46 @@ class DynamicIslandWindow(Gtk.Window):
 
         self._cancel_timer("_anim_timer")
         self._anim_running = True
-        self._anim_timer = GLib.timeout_add(ANIM_INTERVAL_MS, self._anim_step)
 
-    def _anim_step(self):
+        # Synchronize with display frame clock via add_tick_callback
+        if hasattr(self, "add_tick_callback"):
+            try:
+                self._anim_tick_id = self.add_tick_callback(self._on_anim_tick)
+            except Exception:
+                self._anim_tick_id = None
+                self._anim_timer = GLib.timeout_add(ANIM_INTERVAL_MS, self._anim_step)
+        else:
+            self._anim_timer = GLib.timeout_add(ANIM_INTERVAL_MS, self._anim_step)
+
+    def _on_anim_tick(self, widget, frame_clock):
+        if not self._anim_running:
+            self._anim_tick_id = None
+            return False
+        now_ms = (frame_clock.get_frame_time() / 1000.0) if frame_clock else (time.monotonic() * 1000.0)
+        cont = self._anim_step(now_ms=now_ms)
+        if not cont:
+            self._anim_tick_id = None
+            return False
+        return True
+
+    def _anim_step(self, now_ms=None):
         if not self._anim_running:
             return False
 
-        now = time.time() * 1000.0
+        if now_ms is None:
+            now_ms = time.monotonic() * 1000.0
+
         if self._anim_start_time <= 0.0:
-            self._anim_start_time = now
+            self._anim_start_time = now_ms
             elapsed = 0.0
             progress = 0.0
             factor = 0.0
         else:
-            elapsed = now - self._anim_start_time
-            progress = min(1.0, elapsed / float(ANIM_DURATION_MS))
-            # Smooth cubic ease-out deceleration curve
-            factor = 1.0 - (1.0 - progress) ** 3
+            elapsed = max(0.0, now_ms - self._anim_start_time)
+            duration = getattr(self, "_anim_duration_ms", float(ANIM_EXPAND_MS))
+            progress = min(1.0, elapsed / duration)
+            is_expanding = getattr(self, "_anim_is_expanding", True)
+            factor = _anim_curve(progress, is_expanding=is_expanding)
 
         self._current_w = self._start_w + (self._anim_target_w - self._start_w) * factor
         self._current_h = self._start_h + (self._anim_target_h - self._start_h) * factor
@@ -2023,18 +2781,28 @@ class DynamicIslandWindow(Gtk.Window):
                     box.set_opacity(1.0)
                 else:
                     target_start_op = start_opacities.get(box, 0.0)
-                    in_factor = max(0.0, min(1.0, (progress - 0.15) / 0.85))
-                    box.set_opacity(target_start_op + (1.0 - target_start_op) * in_factor)
+                    # Synchronize incoming opacity with geometry expansion
+                    in_factor = max(0.0, min(1.0, (factor - 0.25) / 0.75))
+                    new_op = target_start_op + (1.0 - target_start_op) * in_factor
+                    curr_op = box.get_opacity()
+                    if not isinstance(curr_op, (int, float)) or abs(curr_op - new_op) > 0.005 or progress >= 1.0:
+                        box.set_opacity(new_op)
             else:
                 out_start_op = start_opacities.get(box, 1.0)
-                out_factor = max(0.0, 1.0 - progress * 2.2)
-                box.set_opacity(out_start_op * out_factor)
+                if out_start_op > 0.0:
+                    # Synchronize outgoing opacity with geometry contraction
+                    out_factor = max(0.0, 1.0 - factor * 2.2)
+                    new_op = out_start_op * out_factor
+                    curr_op = box.get_opacity()
+                    if not isinstance(curr_op, (int, float)) or abs(curr_op - new_op) > 0.005 or progress >= 1.0:
+                        box.set_opacity(new_op)
 
         self.queue_draw()
 
         if progress >= 1.0:
             self._anim_running = False
             self._anim_timer = None
+            self._anim_tick_id = None
             self._state = self._target_state
             self._current_w = self._anim_target_w
             self._current_h = self._anim_target_h
@@ -2164,6 +2932,10 @@ class DynamicIslandWindow(Gtk.Window):
             if l_state.get("is_intro"):
                 lyric_text = "• • •"
             elif curr_lyric:
+                # Sanitize multiple newlines: allow at most one natural line break; subsequent breaks collapse to spaces
+                parts = curr_lyric.replace("\r", "").split("\n")
+                if len(parts) > 2:
+                    curr_lyric = parts[0] + "\n" + " ".join(parts[1:])
                 lyric_text = f"“{curr_lyric}”"
             else:
                 lyric_text = "• • •"
@@ -2213,10 +2985,11 @@ class DynamicIslandWindow(Gtk.Window):
         # Verify geometry & monitor workarea on each tick
         self._update_geometry_and_position()
 
-        # Battery power state transitions & low battery notifications
-        if tws and tws.get("is_laptop"):
-            curr_charging = tws.get("charging")
-            pct = tws.get("percent", 0)
+        # Battery power state transitions & low battery notifications for laptop
+        laptop_bat = self.bt.get_laptop_battery()
+        if laptop_bat:
+            curr_charging = laptop_bat.get("charging")
+            pct = laptop_bat.get("percent", 0)
             if self._last_battery_state is not None and curr_charging != self._last_battery_state:
                 if curr_charging:
                     self.show_notification("⚡", "Charger Connected", f"{pct}% battery")
@@ -2252,8 +3025,8 @@ class DynamicIslandWindow(Gtk.Window):
         is_playing = (info.get("status") == "Playing")
         self.compact_activity.set_playing(is_playing)
 
-        title = info.get("title") or "Music"
-        artist = info.get("artist") or ""
+        title = (info.get("title") or "Music").replace("\r", "").replace("\n", " ")
+        artist = (info.get("artist") or "").replace("\r", "").replace("\n", " ")
 
         self.compact_title.set_text(title)
         self.compact_artist.set_text(artist)
@@ -2265,6 +3038,8 @@ class DynamicIslandWindow(Gtk.Window):
         else:
             self.compact_art_image.set_visible(False)
 
+        self._refresh_bt_ui()
+
     def _update_full_ui(self):
         info = self._last_info
         if not info:
@@ -2272,10 +3047,13 @@ class DynamicIslandWindow(Gtk.Window):
 
         is_playing = (info.get("status") == "Playing")
         self.full_activity.set_playing(is_playing)
+        self._refresh_bt_ui()
 
         # Track metadata
-        self.full_title.set_text(info.get("title") or "Not Playing")
-        self.full_artist.set_text(info.get("artist") or "Open Spotify to play")
+        title = (info.get("title") or "Not Playing").replace("\r", "").replace("\n", " ")
+        artist = (info.get("artist") or "Open Spotify to play").replace("\r", "").replace("\n", " ")
+        self.full_title.set_text(title)
+        self.full_artist.set_text(artist)
 
         # Play/pause icon
         icon_name = "media-playback-pause-symbolic" if is_playing else "media-playback-start-symbolic"
@@ -2338,8 +3116,48 @@ class DynamicIslandWindow(Gtk.Window):
                 self.lbl_tot_time.set_text(f"-{format_time(rem_us)}")
 
 # ─────────────────────────────────────────────────────────────
-#  ENTRY POINT
+#  ENTRY POINT & SINGLE-INSTANCE MANAGEMENT
 # ─────────────────────────────────────────────────────────────
+def acquire_single_instance_lock():
+    """Acquires a single-instance advisory lock.
+    Returns (lock_fd, existing_pid). If another instance is running, returns (None, existing_pid).
+    """
+    my_pid = os.getpid()
+
+    # 1. Check proc table for existing running notch.py instances
+    for p in glob.glob("/proc/[0-9]*/cmdline"):
+        try:
+            pid = int(p.split("/")[2])
+            if pid == my_pid:
+                continue
+            with open(p, "rb") as f:
+                cmdline = f.read().decode("utf-8", errors="ignore").replace("\0", " ")
+                if "notch.py" in cmdline and "test" not in cmdline and "grep" not in cmdline:
+                    return None, pid
+        except (IOError, OSError, ValueError):
+            continue
+
+    # 2. Kernel-enforced file lock using fcntl.flock
+    lock_path = os.path.join(tempfile.gettempdir(), f"dynamic_notch_{os.getuid()}.lock")
+    try:
+        lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        os.ftruncate(lock_fd, 0)
+        os.write(lock_fd, f"{my_pid}\n".encode("utf-8"))
+        os.lseek(lock_fd, 0, os.SEEK_SET)
+        return lock_fd, None
+    except (BlockingIOError, IOError):
+        existing_pid = None
+        try:
+            with open(lock_path, "r") as f:
+                content = f.read().strip()
+                if content.isdigit():
+                    existing_pid = int(content)
+        except Exception:
+            pass
+        return None, existing_pid
+
+
 def main():
     if "--cinema-toggle" in sys.argv:
         override = "/tmp/dynamic_notch_cinema_override"
@@ -2352,6 +3170,13 @@ def main():
             print("🎬 Cinema Mode override toggled ON (Dynamic Island suppressed).")
         sys.exit(0)
 
+    # Prevent accidental duplicate instances if already running
+    lock_fd, existing_pid = acquire_single_instance_lock()
+    if lock_fd is None:
+        pid_msg = f" (PID {existing_pid})" if existing_pid else ""
+        print(f"ℹ️  Dynamic Notch is already running{pid_msg}. Preventing duplicate instance.")
+        return 0
+
     print("🚀 Dynamic Notch is running!")
     print("   📍 Position: Centered top notch on Wayland desktop (XWayland).")
     print("   💡 Hover over the notch to expand the music player.")
@@ -2359,7 +3184,14 @@ def main():
     print("   🎬 Cinema Mode: Automatically hides over fullscreen video (VLC/Browser/etc).")
     print("   🛑 Press Ctrl+C to terminate.\n")
     win = DynamicIslandWindow()
-    Gtk.main()
+    try:
+        Gtk.main()
+    finally:
+        if lock_fd is not None:
+            try:
+                os.close(lock_fd)
+            except Exception:
+                pass
 
 if __name__ == "__main__":
     main()

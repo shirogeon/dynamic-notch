@@ -1,18 +1,40 @@
-# Backups
-*.bak*
+# Backups and temporary files
 *.bak
+*.bak*
+*.swp
+*.swo
+*~
+.#*
 
-# Byte-compiled / cache
+# Byte-compiled / Python caches
 __pycache__/
 *.py[cod]
 *$py.class
+*.so
+.pytest_cache/
+.coverage
+htmlcov/
 
-# Environments
+# Virtual environments
 .env
 .venv
 env/
 venv/
+ENV/
+env.bak/
+venv.bak/
 
-# Logs and scratch
+# Logs and runtime artifacts
 *.log
 *.tmp
+/tmp/dynamic_notch_*
+
+# Generated local desktop launcher
+dynamic-notch.desktop
+
+# IDE and OS files
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+.DS_Store
